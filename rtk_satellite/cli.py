@@ -7,6 +7,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 from .gnss import wait_for_rtk_position
 from .mapbox import ImageSettings, download_satellite_image
 from .models import Position
@@ -14,12 +16,40 @@ from .review import review_capture
 from .usage import print_mapbox_usage, record_mapbox_request
 
 
+load_dotenv()
+
+
+def _env_float(name: str) -> float | None:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError as error:
+        raise RuntimeError(f"{name} must be a number, got: {value!r}") from error
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Wait for an RTK position and download a centred satellite image."
+        description="Acquire a GPS position (or use a mock position) and download a centred satellite image."
     )
-    parser.add_argument("--port", default="/dev/serial0", help="NMEA serial port")
-    parser.add_argument("--baud", type=int, default=115200, help="Serial baud rate")
+    parser.add_argument(
+        "--gps-mode",
+        choices=("live", "mock"),
+        default=os.getenv("GPS_MODE", "live").strip().lower() or "live",
+        help="Use live GNSS hardware or a mock coordinate",
+    )
+    parser.add_argument(
+        "--port",
+        default=os.getenv("GPS_PORT", "/dev/serial0"),
+        help="NMEA serial port",
+    )
+    parser.add_argument(
+        "--baud",
+        type=int,
+        default=int(os.getenv("GPS_BAUD", "115200")),
+        help="Serial baud rate",
+    )
     parser.add_argument("--samples", type=int, default=5, help="Consecutive RTK samples")
     parser.add_argument("--timeout", type=float, default=300, help="GNSS timeout in seconds")
     parser.add_argument("--allow-float", action="store_true", help="Accept RTK float fixes")
@@ -33,34 +63,56 @@ def build_parser() -> argparse.ArgumentParser:
         help="Save the image without opening the confirmation window",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("captures"))
-    parser.add_argument("--mock-lat", type=float, help="Test latitude without GNSS hardware")
-    parser.add_argument("--mock-lon", type=float, help="Test longitude without GNSS hardware")
+    parser.add_argument(
+        "--mock-lat",
+        type=float,
+        default=_env_float("MOCK_LAT"),
+        help="Mock latitude",
+    )
+    parser.add_argument(
+        "--mock-lon",
+        type=float,
+        default=_env_float("MOCK_LON"),
+        help="Mock longitude",
+    )
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-
-    if (args.mock_lat is None) != (args.mock_lon is None):
-        print("Error: --mock-lat and --mock-lon must be supplied together", file=sys.stderr)
-        return 2
-
-    token = os.environ.get("MAPBOX_TOKEN", "")
-    if not token:
-        print("Error: set the MAPBOX_TOKEN environment variable", file=sys.stderr)
-        return 2
-
-    settings = ImageSettings(
-        zoom=args.zoom,
-        width=args.width,
-        height=args.height,
-        marker=args.marker,
+def get_mapbox_token() -> str:
+    token = os.getenv("MAPBOX_TOKEN", "").strip()
+    if token:
+        return token
+    raise RuntimeError(
+        "MAPBOX_TOKEN is not configured. Add your Mapbox token to the .env file."
     )
 
+
+def main(argv: list[str] | None = None) -> int:
     try:
-        if args.mock_lat is not None:
+        args = build_parser().parse_args(argv)
+
+        if args.gps_mode == "mock":
+            if args.mock_lat is None or args.mock_lon is None:
+                raise RuntimeError(
+                    "GPS_MODE is set to mock, but MOCK_LAT and MOCK_LON are not configured in .env."
+                )
+
+        token = get_mapbox_token()
+
+        settings = ImageSettings(
+            zoom=args.zoom,
+            width=args.width,
+            height=args.height,
+            marker=args.marker,
+        )
+
+        if args.gps_mode == "mock":
             position = Position.mock(args.mock_lat, args.mock_lon)
             source = "mock"
+            print(
+                f"GPS bypass enabled: using mock position "
+                f"{position.latitude:.8f}, {position.longitude:.8f}"
+            )
         else:
             print(f"Reading NMEA from {args.port} at {args.baud} baud...")
             position = wait_for_rtk_position(

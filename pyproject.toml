@@ -11,6 +11,7 @@ dependencies = [
     "pyserial==3.5",
     "requests==2.32.5",
     "Pillow>=10.0,<13",
+    "python-dotenv>=1.0,<2",
 ]
 
 [project.scripts]

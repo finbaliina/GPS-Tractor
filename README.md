@@ -28,6 +28,18 @@ The program creates `captures/` and `.mapbox_usage.json` when it runs. Both are
 ignored by Git. The access token is read from an environment variable and is not
 stored in this project.
 
+## One-click Windows launcher
+
+For normal use on Windows, double-click `start.bat` in the project folder. The launcher:
+
+- creates `.venv` automatically if it does not exist;
+- installs or checks the packages in `requirements.txt`;
+- reads your Mapbox token from `.env`; and
+- starts GPS Tractor with the virtual environment directly.
+
+You therefore do not need to activate `.venv` or type the Python launch command yourself.
+If `.env` is missing, the launcher creates it from `.env.example`; add your Mapbox token once, then double-click `start.bat` again.
+
 ## Windows setup and mock test
 
 Open PowerShell and change to the folder containing this README. Quotation marks
@@ -63,12 +75,16 @@ Install the dependencies:
 python -m pip install -r requirements.txt
 ```
 
-Set your Mapbox public token for the current PowerShell window. Replace the
-example with the token beginning `pk.` from your Mapbox account:
+Store your Mapbox public token once in a local `.env` file. Copy `.env.example`
+to `.env`, then replace the example value with the token beginning `pk.` from your
+Mapbox account:
 
-```powershell
-$env:MAPBOX_TOKEN="pk.your_token_here"
+```text
+MAPBOX_TOKEN=pk.your_token_here
 ```
+
+The application loads this automatically on every run. `.env` is ignored by Git,
+so your token is not committed to GitHub.
 
 Run a complete test using a coordinate in Edinburgh:
 
@@ -215,3 +231,26 @@ git push
 Because `.gitignore` excludes `.venv`, captures, usage data and `.env`, those
 machine-specific or private files should not be uploaded. Always inspect
 `git status` before committing.
+
+
+## Running without GPS hardware
+
+While developing before the GNSS receiver is available, set this in your local `.env` file:
+
+```text
+GPS_MODE=mock
+MOCK_LAT=55.9533
+MOCK_LON=-3.1883
+```
+
+Then just double-click `start.bat`. The app will skip the serial/GPS stage and use the mock coordinate.
+
+When the receiver is available, switch to:
+
+```text
+GPS_MODE=live
+GPS_PORT=/dev/serial0
+GPS_BAUD=115200
+```
+
+On Windows, `GPS_PORT` will normally be a COM port such as `COM5`.
