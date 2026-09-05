@@ -10,6 +10,8 @@ from pathlib import Path
 from .gnss import wait_for_rtk_position
 from .mapbox import ImageSettings, download_satellite_image
 from .models import Position
+from .review import review_capture
+from .usage import print_mapbox_usage, record_mapbox_request
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -25,6 +27,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--width", type=int, default=1000, help="Image width")
     parser.add_argument("--height", type=int, default=1000, help="Image height")
     parser.add_argument("--marker", action="store_true", help="Draw a pin at the coordinate")
+    parser.add_argument(
+        "--no-review",
+        action="store_true",
+        help="Save the image without opening the confirmation window",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("captures"))
     parser.add_argument("--mock-lat", type=float, help="Test latitude without GNSS hardware")
     parser.add_argument("--mock-lon", type=float, help="Test longitude without GNSS hardware")
@@ -81,6 +88,8 @@ def main(argv: list[str] | None = None) -> int:
             settings=settings,
             destination=image_path,
         )
+        usage = record_mapbox_request()
+        print_mapbox_usage(usage)
 
         metadata = {
             "position": position.as_dict(),
@@ -94,8 +103,19 @@ def main(argv: list[str] | None = None) -> int:
 
         print(f"Saved image: {image_path}")
         print(f"Saved metadata: {metadata_path}")
+
+        if not args.no_review:
+            confirmed, area_name = review_capture(
+                image_path=image_path,
+                metadata_path=metadata_path,
+                latitude=position.latitude,
+                longitude=position.longitude,
+            )
+            if confirmed:
+                print(f"Confirmed area: {area_name}")
+            else:
+                print("Image was not confirmed.")
         return 0
     except (OSError, ValueError, RuntimeError, TimeoutError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
-

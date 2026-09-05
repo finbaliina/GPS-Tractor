@@ -3,4 +3,4 @@ __pycache__/
 *.pyc
 captures/
 .env
-
+.mapbox_usage.json

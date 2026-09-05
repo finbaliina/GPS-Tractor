@@ -1,102 +1,171 @@
-# RTK Satellite Image Fetcher
+# GPS Tractor — RTK Satellite Image Fetcher
 
-A small Raspberry Pi application that:
+This Python project is designed for a Raspberry Pi 5 with an RTK GNSS HAT. It:
 
-1. Reads NMEA data from an RTK GNSS receiver.
+1. Reads NMEA GGA messages from the receiver.
 2. Waits for several consecutive RTK-fixed positions.
-3. Uses their median latitude and longitude as the accepted position.
-4. Downloads a Mapbox satellite image centred on that position.
-5. Saves the image and a JSON metadata file together.
+3. Uses the median coordinate to reduce single-reading noise.
+4. Downloads a Mapbox satellite image centred on that coordinate.
+5. Saves the image and a JSON metadata file.
+6. Opens a simple window for the operator to check the image and name the area.
+7. Maintains a local count of successful Mapbox image requests.
 
-The defaults suit many u-blox ZED-F9P Raspberry Pi HATs, but the serial port,
-baud rate and fix requirements can all be changed from the command line.
+You can test the complete image and review flow on Windows using mock coordinates,
+without connecting the RTK hardware.
 
-## Hardware assumptions
+## What is included
 
-- Raspberry Pi 5 running Raspberry Pi OS 64-bit
-- RTK HAT outputting NMEA over UART or USB
-- An RTK correction source configured separately (for example NTRIP)
-- Internet access for Mapbox and, if used, the NTRIP correction stream
+```text
+rtk_satellite/          Python application package
+tests/                  Automated tests
+.gitignore              Keeps tokens, captures and virtual environments out of Git
+requirements.txt        Python dependencies
+pyproject.toml          Package information
+README.md               This guide
+```
 
-This program reads the corrected position produced by the HAT. It does not yet
-configure an NTRIP client or send RTCM correction messages to the receiver.
+The program creates `captures/` and `.mapbox_usage.json` when it runs. Both are
+ignored by Git. The access token is read from an environment variable and is not
+stored in this project.
 
-## Raspberry Pi setup
+## Windows setup and mock test
 
-If the HAT uses the Pi UART, enable it with `sudo raspi-config`:
+Open PowerShell and change to the folder containing this README. Quotation marks
+are important because `GPS Tractor` contains a space:
 
-- Interface Options -> Serial Port
-- Login shell over serial: **No**
-- Serial hardware enabled: **Yes**
+```powershell
+cd "C:\Users\Finlay\Documents\Projects\GPS Tractor\v1"
+```
 
-Then reboot. The port is normally `/dev/serial0`. A USB receiver will usually
-appear as `/dev/ttyACM0` or `/dev/ttyUSB0`.
+Create a virtual environment. This only needs to be done once:
 
-Install the project:
+```powershell
+py -m venv .venv
+```
 
-```bash
-cd rtk_satellite
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
+Activate it whenever you open a new PowerShell window:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+If PowerShell blocks that script, allow it only for the current PowerShell
+window, then try activation again:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+```
+
+Install the dependencies:
+
+```powershell
 python -m pip install -r requirements.txt
 ```
 
-Create a free Mapbox account and access token, then provide it as an environment
-variable. Do not put the token directly in the source code.
+Set your Mapbox public token for the current PowerShell window. Replace the
+example with the token beginning `pk.` from your Mapbox account:
 
-```bash
-export MAPBOX_TOKEN="your_public_mapbox_token"
+```powershell
+$env:MAPBOX_TOKEN="pk.your_token_here"
 ```
 
-## Run it
+Run a complete test using a coordinate in Edinburgh:
 
-Using the default Pi UART:
-
-```bash
-python -m rtk_satellite
+```powershell
+python -m rtk_satellite --mock-lat 55.9486 --mock-lon -3.1999 --marker
 ```
 
-Using a USB receiver:
+The image should download and then appear in a review window. Enter an area name
+and choose **Confirm and save**, or choose **Image is wrong**. Other useful mock
+locations include:
 
-```bash
-python -m rtk_satellite --port /dev/ttyACM0
+```powershell
+python -m rtk_satellite --mock-lat 51.5074 --mock-lon -0.1278 --marker
+python -m rtk_satellite --mock-lat 57.1497 --mock-lon -2.0943 --marker
 ```
 
-Show the accepted location with a red pin:
+To test downloading without opening the window:
+
+```powershell
+python -m rtk_satellite --mock-lat 55.9486 --mock-lon -3.1999 --no-review
+```
+
+## Raspberry Pi 5 setup
+
+Use Raspberry Pi OS 64-bit. In a terminal, install virtual-environment and UI
+support:
+
+```bash
+sudo apt update
+sudo apt install python3-venv python3-tk
+```
+
+From the project folder:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+export MAPBOX_TOKEN="pk.your_token_here"
+```
+
+If the HAT uses the Pi UART, run `sudo raspi-config`, then select:
+
+- **Interface Options → Serial Port**
+- Login shell over serial: **No**
+- Serial hardware enabled: **Yes**
+
+Reboot afterwards. The UART is normally `/dev/serial0`. A USB receiver will
+usually appear as `/dev/ttyACM0` or `/dev/ttyUSB0`.
+
+Run with the default Pi UART:
 
 ```bash
 python -m rtk_satellite --marker
 ```
 
-Accept an RTK-float solution when a fixed solution is unavailable:
+Or specify a USB serial device:
 
 ```bash
-python -m rtk_satellite --allow-float
+python -m rtk_satellite --port /dev/ttyACM0 --marker
 ```
 
-For a test without GNSS hardware:
+## RTK correction requirement
 
-```bash
-python -m rtk_satellite --mock-lat 55.9533 --mock-lon -3.1883
-```
+The program reads corrected positions produced by the HAT, but it does not yet
+connect to an NTRIP caster or feed RTCM corrections to the receiver. The receiver
+must already be receiving corrections from an NTRIP service or local base station.
 
-Useful options:
+NMEA GGA fix qualities used by the program are:
 
-```text
---port /dev/serial0       NMEA serial device
---baud 115200             Receiver baud rate
---zoom 18                 Mapbox zoom (roughly neighbourhood/building scale)
---width 1000              Output image width, maximum 1280
---height 1000             Output image height, maximum 1280
---samples 5               Consecutive acceptable positions required
---timeout 300             Maximum seconds to wait for a position
---output-dir captures     Destination directory
---allow-float             Accept NMEA fix quality 5 as well as quality 4
---marker                  Draw a pin on the accepted coordinate
-```
+- `4`: RTK fixed — accepted by default
+- `5`: RTK float — accepted only when `--allow-float` is used
 
-Each run creates a timestamped folder such as:
+By default, five consecutive RTK-fixed readings are required. The program waits
+up to 300 seconds.
+
+## Common options
+
+| Option | Meaning |
+|---|---|
+| `--port /dev/serial0` | NMEA serial device |
+| `--baud 115200` | Receiver baud rate |
+| `--samples 5` | Consecutive acceptable positions required |
+| `--timeout 300` | Maximum time to wait for a position |
+| `--allow-float` | Also accept RTK-float quality |
+| `--zoom 18` | Mapbox zoom level |
+| `--width 1000` | Image width, up to 1280 pixels |
+| `--height 1000` | Image height, up to 1280 pixels |
+| `--marker` | Draw a red marker at the coordinate |
+| `--no-review` | Save without opening the review window |
+| `--output-dir captures` | Change the capture destination |
+
+Run `python -m rtk_satellite --help` to see the command-line help.
+
+## Saved results
+
+Every successful run creates a timestamped directory:
 
 ```text
 captures/20260905T201530Z/
@@ -104,24 +173,45 @@ captures/20260905T201530Z/
     metadata.json
 ```
 
-The metadata records the coordinate, altitude, fix quality, satellite count,
-HDOP, image settings and capture time.
+The metadata contains the coordinate, positioning source, fix information, image
+settings and creation time. After review it also contains whether the operator
+confirmed the image and the chosen area name.
 
-## RTK status
+## Mapbox request counter
 
-The NMEA GGA fix-quality values used here are:
+One successful image download normally makes one Mapbox Static Images API request;
+it does not consume a separate object called a “token.” The token identifies and
+authorizes your account. The program increments `.mapbox_usage.json` after each
+successful download and resets its local count when the UTC month changes.
 
-- `4`: RTK fixed (accepted by default)
-- `5`: RTK float (accepted only with `--allow-float`)
+This count only knows about requests made by this copy of the project. It cannot
+see requests from other computers, deleted usage files, failed requests that may
+have reached Mapbox, or account-wide billing. Mapbox's dashboard is authoritative
+and may not update immediately. The displayed 50,000-request allowance is an
+estimate configured in `rtk_satellite/usage.py`; check your current Mapbox plan
+before relying on it.
 
-An RTK HAT cannot become RTK-fixed from satellite signals alone. It needs RTCM
-corrections from a local base station or an NTRIP service. It may still output a
-normal GNSS position before those corrections arrive, but this application will
-keep waiting rather than treating that as an RTK position.
+## Automated tests
 
-## Run the tests
+With the virtual environment activated:
 
-```bash
+```powershell
 python -m unittest discover -s tests -v
 ```
 
+The tests do not use your Mapbox token, make network requests or need GNSS hardware.
+
+## Upload changes to GitHub
+
+After copying these files into your Git repository and testing them:
+
+```powershell
+git status
+git add .
+git commit -m "Add complete RTK satellite capture and review app"
+git push
+```
+
+Because `.gitignore` excludes `.venv`, captures, usage data and `.env`, those
+machine-specific or private files should not be uploaded. Always inspect
+`git status` before committing.
