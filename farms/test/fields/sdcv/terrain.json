@@ -1,0 +1,15 @@
+{
+  "terrain_tile_zoom": 14,
+  "grid_width": 300,
+  "grid_height": 300,
+  "contour_interval_m": 2.0,
+  "mean_slope_deg": 5.282187461853027,
+  "median_slope_deg": 4.58486795425415,
+  "p90_slope_deg": 8.462910652160645,
+  "max_slope_deg": 15.681692123413086,
+  "min_elevation_m": 187.7001953125,
+  "max_elevation_m": 233.5,
+  "elevation_range_m": 45.7998046875,
+  "contour_slope_threshold_deg": 5.0,
+  "contour_mode_candidate": true
+}

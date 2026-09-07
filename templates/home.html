@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Farms · GPS Tractor{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <div class="eyebrow">Setup</div>
+    <h1>Farms</h1>
+    <p>Set the farm up once while online. After that, fields and routes are stored locally.</p>
+  </div>
+  <a class="primary button-link large" href="{{ url_for('setup_search') }}">Set up new farm</a>
+</div>
+
+<div class="grid cards">
+  {% for farm in farms %}
+  <a class="card farm-card" href="{{ url_for('farm_page', farm_id=farm.id) }}">
+    <div>
+      <h2>{{ farm.name }}</h2>
+      <p>{{ farm.field_count }} field{% if farm.field_count != 1 %}s{% endif %}</p>
+    </div>
+    <span class="arrow">→</span>
+  </a>
+  {% endfor %}
+</div>
+
+{% if not farms %}
+<section class="panel">
+  <h2>No farms configured yet</h2>
+  <p class="muted">Start with the farm name and postcode. The setup screen will show likely cadastral parcels on satellite imagery for confirmation.</p>
+  <a class="primary button-link" href="{{ url_for('setup_search') }}">Set up first farm</a>
+</section>
+{% endif %}
+
+<details class="panel">
+  <summary><strong>Manual / development setup</strong></summary>
+  <p class="muted">Create an empty farm without doing the one-off cadastral lookup.</p>
+  <form method="post" action="{{ url_for('new_farm') }}" class="row-form">
+    <input name="name" placeholder="Farm name" required>
+    <button class="secondary" type="submit">Create empty farm</button>
+  </form>
+</details>
+{% endblock %}

@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% block title %}Edit {{ field.name }} · GPS Tractor{% endblock %}
+{% block content %}
+<div class="page-header compact">
+  <div>
+    <div class="eyebrow">{{ farm.name }}</div>
+    <h1>{{ field.name }}</h1>
+    <p>Edit the approved field boundary, then generate the route inside it.</p>
+  </div>
+  <a class="secondary button-link" href="{{ url_for('farm_page', farm_id=farm.id) }}">Back to farm</a>
+</div>
+
+<div class="editor-layout">
+  <section class="map-panel">
+    <div id="mapWrap" class="map-wrap">
+      <img
+        id="satelliteImage"
+        src="{{ url_for('field_satellite', farm_id=farm.id, field_id=field.id) }}"
+        alt="Satellite field image"
+        draggable="false"
+      >
+      <svg id="boundarySvg" class="boundary-svg"></svg>
+    </div>
+
+    <div id="routePreviewPanel" class="route-preview-panel" hidden>
+      <div class="route-preview-header">
+        <div>
+          <div class="eyebrow">Generated route</div>
+          <h2 id="routeSummary">Route ready</h2>
+        </div>
+      </div>
+      <img
+        id="routePreviewImage"
+        class="route-preview-image"
+        alt="Generated field route"
+      >
+    </div>
+  </section>
+
+  <aside class="tool-panel">
+    <div class="tool-group">
+      <div class="eyebrow">Boundary tools</div>
+      <h2>Adjust field</h2>
+      <p class="muted">
+        Drag the white points. Add points where the CV missed a corner, or
+        delete unnecessary points.
+      </p>
+    </div>
+
+    <div class="tool-grid">
+      <button id="selectMode" class="primary">Move points</button>
+      <button id="addMode" class="secondary">Add point</button>
+      <button id="deletePoint" class="secondary">Delete selected</button>
+      <button id="undoButton" class="secondary">Undo</button>
+    </div>
+
+    <div class="tool-group">
+      <label class="checkbox-row">
+        <input id="showDetected" type="checkbox" checked>
+        Show original CV boundary
+      </label>
+    </div>
+
+    <div class="tool-group">
+      <div class="metric">
+        <span>Points</span>
+        <strong id="pointCount">0</strong>
+      </div>
+      <div class="metric">
+        <span>Status</span>
+        <strong id="saveStatus">Not changed</strong>
+      </div>
+    </div>
+
+    <div id="routeResult" class="route-result" hidden></div>
+
+    <div class="tool-group bottom-actions">
+      <button id="resetButton" class="danger-outline">Reset to CV</button>
+      <button id="saveButton" class="secondary large">Save boundary</button>
+      <button id="generateButton" class="primary large">Save & generate route</button>
+    </div>
+  </aside>
+</div>
+
+<script>
+window.FIELD_EDITOR_CONFIG = {
+  apiUrl: "{{ url_for('field_api', farm_id=farm.id, field_id=field.id) }}",
+  saveUrl: "{{ url_for('save_boundary_api', farm_id=farm.id, field_id=field.id) }}",
+  resetUrl: "{{ url_for('reset_boundary_api', farm_id=farm.id, field_id=field.id) }}",
+  routeUrl: "{{ url_for('regenerate_route_api', farm_id=farm.id, field_id=field.id) }}",
+  routeImageUrl: "{{ url_for('field_route_overlay', farm_id=farm.id, field_id=field.id) }}"
+};
+</script>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='boundary_editor.js') }}"></script>
+{% endblock %}

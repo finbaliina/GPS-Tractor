@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block title %}{{ farm.name }} · GPS Tractor{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <div class="eyebrow">Farm</div>
+    <h1>{{ farm.name }}</h1>
+    <p>
+      {{ farm.fields|length }} configured field{% if farm.fields|length != 1 %}s{% endif %}
+      {% if farm.setup_complete %} · farm setup saved locally{% endif %}
+    </p>
+  </div>
+  <a class="secondary button-link" href="{{ url_for('home') }}">All farms</a>
+</div>
+
+{% if farm.setup_complete %}
+<section class="panel farm-setup-summary">
+  <div>
+    <div class="eyebrow">Initial setup complete</div>
+    <h2>{{ farm.cadastral_parcel_count }} cadastral parcel{% if farm.cadastral_parcel_count != 1 %}s{% endif %} saved</h2>
+    <p class="muted">The farm extent and extra surrounding search area are now local. Adding or editing fields does not need another registry lookup.</p>
+  </div>
+  <span class="status ok">offline-ready farm data</span>
+</section>
+{% endif %}
+
+<div class="grid cards">
+  {% for field in farm.fields %}
+  <div class="card field-card">
+    <div>
+      <div class="status-row">
+        <span class="status {% if field.boundary_source != 'cv' %}ok{% endif %}">
+          {{ field.boundary_source|replace('_', ' ') }}
+        </span>
+        <span class="status {% if field.route_ready %}ok{% endif %}">
+          {% if field.route_ready %}route ready{% else %}route needed{% endif %}
+        </span>
+      </div>
+      <h2>{{ field.name }}</h2>
+    </div>
+
+    <div class="card-actions">
+      <a class="secondary button-link"
+         href="{{ url_for('boundary_editor', farm_id=farm.id, field_id=field.id) }}">
+        Edit boundary
+      </a>
+      {% if field.route_ready %}
+      <a class="primary button-link"
+         href="{{ url_for('drive_preview', farm_id=farm.id, field_id=field.id) }}">
+        Open field
+      </a>
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+<section class="panel">
+  <h2>Add another field</h2>
+  <p class="muted">
+    Fields can be added at any time without repeating farm setup. For this draft,
+    run the existing capture/CV pipeline and import its result here.
+  </p>
+
+  {% if captures %}
+  <form method="post" action="{{ url_for('add_field', farm_id=farm.id) }}" class="stack-form">
+    <label>
+      Field name
+      <input name="field_name" placeholder="North Field" required>
+    </label>
+
+    <label>
+      Capture
+      <select name="capture_id" required>
+        {% for capture in captures %}
+        <option value="{{ capture.id }}">{{ capture.label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+
+    <button class="primary" type="submit">Import and edit field</button>
+  </form>
+  {% else %}
+  <div class="empty-state">
+    No usable captures found. A capture needs <code>satellite.png</code> and
+    <code>field_boundary.json</code>.
+  </div>
+  {% endif %}
+</section>
+{% endblock %}
