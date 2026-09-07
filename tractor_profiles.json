@@ -1,0 +1,16 @@
+{
+  "default_tractor": {
+    "wheelbase_m": 2.6,
+    "max_steering_angle_deg": 35.0,
+    "minimum_turning_radius_m": 4.5,
+    "use_measured_turning_radius": true,
+    "can_reverse": true
+  },
+  "example_large_tractor": {
+    "wheelbase_m": 3.1,
+    "max_steering_angle_deg": 32.0,
+    "minimum_turning_radius_m": 5.8,
+    "use_measured_turning_radius": true,
+    "can_reverse": true
+  }
+}

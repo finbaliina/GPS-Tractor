@@ -1,256 +1,95 @@
-# GPS Tractor — RTK Satellite Image Fetcher
+# GPS Tractor
 
-This Python project is designed for a Raspberry Pi 5 with an RTK GNSS HAT. It:
-
-1. Reads NMEA GGA messages from the receiver.
-2. Waits for several consecutive RTK-fixed positions.
-3. Uses the median coordinate to reduce single-reading noise.
-4. Downloads a Mapbox satellite image centred on that coordinate.
-5. Saves the image and a JSON metadata file.
-6. Opens a simple window for the operator to check the image and name the area.
-7. Maintains a local count of successful Mapbox image requests.
-
-You can test the complete image and review flow on Windows using mock coordinates,
-without connecting the RTK hardware.
-
-## What is included
+The main program is deliberately split into one file per step:
 
 ```text
-rtk_satellite/          Python application package
-tests/                  Automated tests
-.gitignore              Keeps tokens, captures and virtual environments out of Git
-requirements.txt        Python dependencies
-pyproject.toml          Package information
-README.md               This guide
+main.py                 Calls each step in order
+gps_location.py         Gets mock or RTK GPS position
+satellite_image.py      Downloads Mapbox image and records image scale
+image_review.py         Lets the operator confirm/name the image
+field_boundary.py       Runs SAM and draws the detected field boundary
+route_planning.py       Chooses the parallel coverage route
+route_visualisation.py  Draws the route over the satellite image
+tractor_profiles.json   Tractor geometry
+.env                    User/machine settings (not committed)
 ```
 
-The program creates `captures/` and `.mapbox_usage.json` when it runs. Both are
-ignored by Git. The access token is read from an environment variable and is not
-stored in this project.
+`main.py` should stay small. If a step changes later — for example SAM moves
+from the local PC to AWS — only that step's file should need replacing.
 
-## One-click Windows launcher
+## Current process
 
-For normal use on Windows, double-click `start.bat` in the project folder. The launcher:
+```text
+GPS position
+    ↓
+Mapbox satellite image
+    ↓
+operator confirms image
+    ↓
+SAM field boundary
+    ↓
+route optimisation
+    ↓
+route drawn over image
+```
 
-- creates `.venv` automatically if it does not exist;
-- installs or checks the packages in `requirements.txt`;
-- reads your Mapbox token from `.env`; and
-- starts GPS Tractor with the virtual environment directly.
+Every run writes its outputs to one timestamped folder under `captures/`.
 
-You therefore do not need to activate `.venv` or type the Python launch command yourself.
-If `.env` is missing, the launcher creates it from `.env.example`; add your Mapbox token once, then double-click `start.bat` again.
+## Windows development setup
 
-## Windows setup and mock test
+This project deliberately does not include `.venv`.
 
-Open PowerShell and change to the folder containing this README. Quotation marks
-are important because `GPS Tractor` contains a space:
+Create it:
 
 ```powershell
 cd "C:\Users\Finlay\Documents\Projects\GPS Tractor\v1"
-```
-
-Create a virtual environment. This only needs to be done once:
-
-```powershell
-py -m venv .venv
-```
-
-Activate it whenever you open a new PowerShell window:
-
-```powershell
+py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-```
-
-If PowerShell blocks that script, allow it only for the current PowerShell
-window, then try activation again:
-
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\.venv\Scripts\Activate.ps1
-```
-
-Install the dependencies:
-
-```powershell
 python -m pip install -r requirements.txt
 ```
 
-Store your Mapbox public token once in a local `.env` file. Copy `.env.example`
-to `.env`, then replace the example value with the token beginning `pk.` from your
-Mapbox account:
+For the RTX 3070 Ti, install CUDA PyTorch before SAM:
+
+```powershell
+python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+python -m pip install git+https://github.com/facebookresearch/sam2.git
+```
+
+Check the GPU:
+
+```powershell
+python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
+```
+
+Copy `.env.example` to `.env`, add the Mapbox token, then run:
 
 ```text
-MAPBOX_TOKEN=pk.your_token_here
+start.bat
 ```
 
-The application loads this automatically on every run. `.env` is ignored by Git,
-so your token is not committed to GitHub.
+## Configuration
 
-Run a complete test using a coordinate in Edinburgh:
+Normal values live in `.env`; tractor geometry lives in `tractor_profiles.json`.
 
-```powershell
-python -m rtk_satellite --mock-lat 55.9486 --mock-lon -3.1999 --marker
-```
-
-The image should download and then appear in a review window. Enter an area name
-and choose **Confirm and save**, or choose **Image is wrong**. Other useful mock
-locations include:
-
-```powershell
-python -m rtk_satellite --mock-lat 51.5074 --mock-lon -0.1278 --marker
-python -m rtk_satellite --mock-lat 57.1497 --mock-lon -2.0943 --marker
-```
-
-To test downloading without opening the window:
-
-```powershell
-python -m rtk_satellite --mock-lat 55.9486 --mock-lon -3.1999 --no-review
-```
-
-## Raspberry Pi 5 setup
-
-Use Raspberry Pi OS 64-bit. In a terminal, install virtual-environment and UI
-support:
-
-```bash
-sudo apt update
-sudo apt install python3-venv python3-tk
-```
-
-From the project folder:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-export MAPBOX_TOKEN="pk.your_token_here"
-```
-
-If the HAT uses the Pi UART, run `sudo raspi-config`, then select:
-
-- **Interface Options → Serial Port**
-- Login shell over serial: **No**
-- Serial hardware enabled: **Yes**
-
-Reboot afterwards. The UART is normally `/dev/serial0`. A USB receiver will
-usually appear as `/dev/ttyACM0` or `/dev/ttyUSB0`.
-
-Run with the default Pi UART:
-
-```bash
-python -m rtk_satellite --marker
-```
-
-Or specify a USB serial device:
-
-```bash
-python -m rtk_satellite --port /dev/ttyACM0 --marker
-```
-
-## RTK correction requirement
-
-The program reads corrected positions produced by the HAT, but it does not yet
-connect to an NTRIP caster or feed RTCM corrections to the receiver. The receiver
-must already be receiving corrections from an NTRIP service or local base station.
-
-NMEA GGA fix qualities used by the program are:
-
-- `4`: RTK fixed — accepted by default
-- `5`: RTK float — accepted only when `--allow-float` is used
-
-By default, five consecutive RTK-fixed readings are required. The program waits
-up to 300 seconds.
-
-## Common options
-
-| Option | Meaning |
-|---|---|
-| `--port /dev/serial0` | NMEA serial device |
-| `--baud 115200` | Receiver baud rate |
-| `--samples 5` | Consecutive acceptable positions required |
-| `--timeout 300` | Maximum time to wait for a position |
-| `--allow-float` | Also accept RTK-float quality |
-| `--zoom 18` | Mapbox zoom level |
-| `--width 1000` | Image width, up to 1280 pixels |
-| `--height 1000` | Image height, up to 1280 pixels |
-| `--marker` | Draw a red marker at the coordinate |
-| `--no-review` | Save without opening the review window |
-| `--output-dir captures` | Change the capture destination |
-
-Run `python -m rtk_satellite --help` to see the command-line help.
-
-## Saved results
-
-Every successful run creates a timestamped directory:
-
-```text
-captures/20260905T201530Z/
-    satellite.png
-    metadata.json
-```
-
-The metadata contains the coordinate, positioning source, fix information, image
-settings and creation time. After review it also contains whether the operator
-confirmed the image and the chosen area name.
-
-## Mapbox request counter
-
-One successful image download normally makes one Mapbox Static Images API request;
-it does not consume a separate object called a “token.” The token identifies and
-authorizes your account. The program increments `.mapbox_usage.json` after each
-successful download and resets its local count when the UTC month changes.
-
-This count only knows about requests made by this copy of the project. It cannot
-see requests from other computers, deleted usage files, failed requests that may
-have reached Mapbox, or account-wide billing. Mapbox's dashboard is authoritative
-and may not update immediately. The displayed 50,000-request allowance is an
-estimate configured in `rtk_satellite/usage.py`; check your current Mapbox plan
-before relying on it.
-
-## Automated tests
-
-With the virtual environment activated:
-
-```powershell
-python -m unittest discover -s tests -v
-```
-
-The tests do not use your Mapbox token, make network requests or need GNSS hardware.
-
-## Upload changes to GitHub
-
-After copying these files into your Git repository and testing them:
-
-```powershell
-git status
-git add .
-git commit -m "Add complete RTK satellite capture and review app"
-git push
-```
-
-Because `.gitignore` excludes `.venv`, captures, usage data and `.env`, those
-machine-specific or private files should not be uploaded. Always inspect
-`git status` before committing.
-
-
-## Running without GPS hardware
-
-While developing before the GNSS receiver is available, set this in your local `.env` file:
+While the GPS receiver is not fitted, leave:
 
 ```text
 GPS_MODE=mock
-MOCK_LAT=55.9533
-MOCK_LON=-3.1883
 ```
 
-Then just double-click `start.bat`. The app will skip the serial/GPS stage and use the mock coordinate.
+The satellite image defaults to zoom 14 so that whole UK fields are more likely
+to fit in the image.
 
-When the receiver is available, switch to:
+## Route-planning status
 
-```text
-GPS_MODE=live
-GPS_PORT=/dev/serial0
-GPS_BAUD=115200
-```
+The planner currently:
+- reserves a headland;
+- generates parallel passes at the implement width;
+- tries orientations from 0–180 degrees;
+- estimates the cost of turns using tractor turning radius;
+- chooses the lowest estimated-time route.
 
-On Windows, `GPS_PORT` will normally be a COM port such as `COM5`.
+The white connections drawn between passes currently show **route order only**.
+They are not yet physically accurate turning paths. Wheelbase, steering angle,
+minimum turning radius and reverse capability are already stored in
+`tractor_profiles.json` ready for the next stage.
