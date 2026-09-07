@@ -29,6 +29,15 @@ class RoutePlan:
 
 def plan_route(field: Polygon, metres_per_pixel: float) -> RoutePlan:
     """Choose the lowest-cost parallel coverage direction."""
+    field_area_m2 = field.area * metres_per_pixel**2
+    min_x, min_y, max_x, max_y = field.bounds
+    field_width_m = (max_x - min_x) * metres_per_pixel
+    field_height_m = (max_y - min_y) * metres_per_pixel
+    print(
+        f"Detected field: approximately "
+        f"{field_width_m:.1f} m × {field_height_m:.1f} m, "
+        f"{field_area_m2:.0f} m²"
+    )
     implement_m = float(os.getenv("IMPLEMENT_WIDTH_M", "6"))
     headland_m = float(os.getenv("HEADLAND_WIDTH_M", "10"))
     overlap = float(os.getenv("OVERLAP", "0.02"))

@@ -52,8 +52,23 @@ def detect_field(image_path: Path, output_dir: Path) -> FieldBoundary:
                 multimask_output=True,
             )
 
-    index = int(np.argmax(scores))
-    mask = (masks[index].astype(np.uint8) * 255)
+    # Choose the largest suggested region that contains the centre point.
+    cx = width // 2
+    cy = height // 2
+
+    possible = []
+
+    for i, mask in enumerate(masks):
+        if mask[cy, cx]:
+            area = np.count_nonzero(mask)
+            possible.append((area, i))
+
+    if not possible:
+        raise RuntimeError("SAM did not detect a region containing the GPS position.")
+
+    _, index = max(possible)
+
+    mask = masks[index].astype(np.uint8) * 255
     score = float(scores[index])
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -61,13 +76,18 @@ def detect_field(image_path: Path, output_dir: Path) -> FieldBoundary:
         raise RuntimeError("SAM did not return a usable field boundary.")
 
     contour = max(contours, key=cv2.contourArea)
-    epsilon = 0.002 * cv2.arcLength(contour, True)
+    simplify_fraction = float(os.getenv("BOUNDARY_SIMPLIFY", "0.01"))
+    epsilon = simplify_fraction * cv2.arcLength(contour, True)
     contour = cv2.approxPolyDP(contour, epsilon, True)
 
     points = contour[:, 0, :].astype(float)
     polygon = Polygon(points)
     if not polygon.is_valid:
         polygon = polygon.buffer(0)
+    if polygon.geom_type == "MultiPolygon":
+        polygon = max(polygon.geoms, key=lambda p: p.area)
+    if polygon.is_empty:
+        raise RuntimeError("SAM did not produce a usable field polygon.")
 
     mask_path = output_dir / "mask.png"
     overlay_path = output_dir / "field_boundary.png"

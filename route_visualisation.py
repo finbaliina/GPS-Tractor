@@ -2,24 +2,21 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from shapely.geometry import Polygon
-
-from route_planning import RoutePlan
 
 
 def draw_route(
     image_path: Path,
-    field: Polygon,
-    plan: RoutePlan,
+    field,
+    plan,
     output_path: Path,
 ):
-    """Draw the detected field, headland and planned route over the image."""
+    """Draw field, working polygon and straight/contour route over the image."""
     image = cv2.imread(str(image_path))
     if image is None:
         raise FileNotFoundError(image_path)
 
-    _polygon(image, field, (0, 255, 0), 3)
-    _polygon(image, plan.working_polygon, (0, 215, 255), 2)
+    _geometry_outline(image, field, (0, 255, 0), 3)
+    _geometry_outline(image, plan.working_polygon, (0, 215, 255), 2)
 
     for i, swath in enumerate(plan.swaths):
         points = _line(swath)
@@ -30,11 +27,17 @@ def draw_route(
 
         if i == 0 or (i + 1) % 5 == 0:
             cv2.putText(
-                image, str(i + 1), (start[0] + 4, start[1] - 4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1
+                image,
+                str(i + 1),
+                (start[0] + 4, start[1] - 4),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                (255, 255, 255),
+                1,
             )
 
-    # Straight connectors only show route order. Real turn curves come later.
+    # These are still route-order indicators only.
+    # They are NOT yet steering-constrained tractor turns.
     for current, nxt in zip(plan.swaths, plan.swaths[1:]):
         a = tuple(np.rint(current.coords[-1]).astype(int))
         b = tuple(np.rint(nxt.coords[0]).astype(int))
@@ -44,9 +47,17 @@ def draw_route(
     print(f"Saved route overlay: {output_path}")
 
 
-def _polygon(image, polygon, colour, thickness):
-    points = np.rint(np.asarray(polygon.exterior.coords)).astype(np.int32)
-    cv2.polylines(image, [points], True, colour, thickness, cv2.LINE_AA)
+def _geometry_outline(image, geometry, colour, thickness):
+    if geometry.geom_type == "Polygon":
+        polygons = [geometry]
+    elif geometry.geom_type == "MultiPolygon":
+        polygons = list(geometry.geoms)
+    else:
+        return
+
+    for polygon in polygons:
+        points = np.rint(np.asarray(polygon.exterior.coords)).astype(np.int32)
+        cv2.polylines(image, [points], True, colour, thickness, cv2.LINE_AA)
 
 
 def _line(line):

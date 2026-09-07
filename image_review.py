@@ -60,9 +60,9 @@ def review_image(image_path: Path, metadata_path: Path, position: Position) -> b
 
     buttons = ttk.Frame(frame)
     buttons.pack()
-    ttk.Button(buttons, text="Wrong image", command=lambda: finish(False)).pack(side="left", padx=5)
     ttk.Button(buttons, text="Confirm", command=lambda: finish(True)).pack(side="left", padx=5)
-
+    ttk.Button(buttons, text="Wrong image", command=lambda: finish(False)).pack(side="left", padx=5)
+    
     root.mainloop()
     return result["confirmed"]
 
