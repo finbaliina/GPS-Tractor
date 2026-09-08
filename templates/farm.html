@@ -7,7 +7,7 @@
     <h1>{{ farm.name }}</h1>
     <p>
       {{ farm.fields|length }} configured field{% if farm.fields|length != 1 %}s{% endif %}
-      {% if farm.setup_complete %} · farm setup saved locally{% endif %}
+      {% if farm.setup_complete %} · farm area saved locally{% endif %}
     </p>
   </div>
   <a class="secondary button-link" href="{{ url_for('home') }}">All farms</a>
@@ -16,11 +16,30 @@
 {% if farm.setup_complete %}
 <section class="panel farm-setup-summary">
   <div>
-    <div class="eyebrow">Initial setup complete</div>
-    <h2>{{ farm.cadastral_parcel_count }} cadastral parcel{% if farm.cadastral_parcel_count != 1 %}s{% endif %} saved</h2>
-    <p class="muted">The farm extent and extra surrounding search area are now local. Adding or editing fields does not need another registry lookup.</p>
+    <div class="eyebrow">Farm area ready</div>
+    <h2>{{ farm.search_area_count }} selected area{% if farm.search_area_count != 1 %}s{% endif %}</h2>
+    <p class="muted">The rough farm search area is stored locally. No land-registry lookup is involved.</p>
   </div>
-  <span class="status ok">offline-ready farm data</span>
+  <span class="status ok">setup saved</span>
+</section>
+
+<section class="panel">
+  <h2>Find fields automatically</h2>
+  <p class="muted">Download detailed satellite imagery only inside the area you selected, run SAM, then review the candidate fields one by one.</p>
+  {% if discovery_error %}<div class="route-result error">{{ discovery_error }}</div>{% endif %}
+  <div class="discovery-actions">
+    {% if candidate_count %}
+      <a class="primary button-link" href="{{ url_for('review_fields', farm_id=farm.id) }}">Review {{ pending_candidate_count }} pending fields</a>
+      <form method="post" action="{{ url_for('discover_farm_fields', farm_id=farm.id) }}">
+        <input type="hidden" name="force" value="1">
+        <button class="secondary" type="submit">Run field scan again</button>
+      </form>
+    {% else %}
+      <form method="post" action="{{ url_for('discover_farm_fields', farm_id=farm.id) }}">
+        <button class="primary large" type="submit">Scan selected area for fields</button>
+      </form>
+    {% endif %}
+  </div>
 </section>
 {% endif %}
 
@@ -40,15 +59,9 @@
     </div>
 
     <div class="card-actions">
-      <a class="secondary button-link"
-         href="{{ url_for('boundary_editor', farm_id=farm.id, field_id=field.id) }}">
-        Edit boundary
-      </a>
+      <a class="secondary button-link" href="{{ url_for('boundary_editor', farm_id=farm.id, field_id=field.id) }}">Edit boundary</a>
       {% if field.route_ready %}
-      <a class="primary button-link"
-         href="{{ url_for('drive_preview', farm_id=farm.id, field_id=field.id) }}">
-        Open field
-      </a>
+      <a class="primary button-link" href="{{ url_for('drive_preview', farm_id=farm.id, field_id=field.id) }}">Open field</a>
       {% endif %}
     </div>
   </div>
@@ -56,19 +69,14 @@
 </div>
 
 <section class="panel">
-  <h2>Add another field</h2>
+  <h2>Add another field later</h2>
   <p class="muted">
-    Fields can be added at any time without repeating farm setup. For this draft,
-    run the existing capture/CV pipeline and import its result here.
+    You never need to repeat farm setup. Run the existing GPS/capture pipeline at the new field, then import that capture here.
   </p>
 
   {% if captures %}
   <form method="post" action="{{ url_for('add_field', farm_id=farm.id) }}" class="stack-form">
-    <label>
-      Field name
-      <input name="field_name" placeholder="North Field" required>
-    </label>
-
+    <label>Field name<input name="field_name" placeholder="North Field" required></label>
     <label>
       Capture
       <select name="capture_id" required>
@@ -77,14 +85,10 @@
         {% endfor %}
       </select>
     </label>
-
     <button class="primary" type="submit">Import and edit field</button>
   </form>
   {% else %}
-  <div class="empty-state">
-    No usable captures found. A capture needs <code>satellite.png</code> and
-    <code>field_boundary.json</code>.
-  </div>
+  <div class="empty-state">No usable captures found yet.</div>
   {% endif %}
 </section>
 {% endblock %}

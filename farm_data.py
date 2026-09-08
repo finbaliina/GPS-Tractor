@@ -110,8 +110,8 @@ def get_farm(farm_id: str) -> dict[str, Any]:
         "name": metadata.get("name", farm_id),
         "postcode": metadata.get("postcode"),
         "setup_complete": bool(metadata.get("setup_complete", False)),
-        "cadastral_parcel_count": int(metadata.get("cadastral_parcel_count", 0)),
-        "cadastral_sources": metadata.get("cadastral_sources", []),
+        "setup_method": metadata.get("setup_method"),
+        "search_area_count": int(metadata.get("search_area_count", 0)),
         "fields": fields,
     }
 
@@ -284,6 +284,7 @@ def get_field(farm_id: str, field_id: str) -> dict[str, Any]:
         "points": points,
         "detected_points": detected,
         "route_ready": (path / "route_plan.json").exists(),
+        "source_candidate": data.get("source_candidate"),
     }
 
 

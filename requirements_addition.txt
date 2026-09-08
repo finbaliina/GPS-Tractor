@@ -1,3 +1,0 @@
-Flask>=3,<4
-geopandas>=1.0
-pyogrio>=0.9

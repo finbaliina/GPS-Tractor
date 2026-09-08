@@ -25,14 +25,14 @@
 {% if not farms %}
 <section class="panel">
   <h2>No farms configured yet</h2>
-  <p class="muted">Start with the farm name and postcode. The setup screen will show likely cadastral parcels on satellite imagery for confirmation.</p>
+  <p class="muted">Find the farm by name/postcode, then draw one or more rough boxes around the land you operate.</p>
   <a class="primary button-link" href="{{ url_for('setup_search') }}">Set up first farm</a>
 </section>
 {% endif %}
 
 <details class="panel">
   <summary><strong>Manual / development setup</strong></summary>
-  <p class="muted">Create an empty farm without doing the one-off cadastral lookup.</p>
+  <p class="muted">Create an empty farm without the satellite-area setup.</p>
   <form method="post" action="{{ url_for('new_farm') }}" class="row-form">
     <input name="name" placeholder="Farm name" required>
     <button class="secondary" type="submit">Create empty farm</button>

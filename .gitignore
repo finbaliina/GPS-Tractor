@@ -1,6 +1,12 @@
 .venv/
 .env
-captures/
 __pycache__/
 *.pyc
+*.pyo
+*.log
+~$*
+
+captures/
+farms/
+setup_cache/
 .mapbox_usage.json

@@ -1,38 +1,31 @@
 {% extends "base.html" %}
 {% block title %}Set up farm · GPS Tractor{% endblock %}
 {% block content %}
-<div class="page-header">
+<div class="page-header compact">
   <div>
-    <div class="eyebrow">Initial setup</div>
+    <div class="eyebrow">Initial setup · 1 of 3</div>
     <h1>Find your farm</h1>
-    <p>We use this once to find likely registered land around the farm. After setup, the saved farm works locally.</p>
+    <p>We only use this to centre a broad satellite view. You will confirm the actual land on the next screen.</p>
   </div>
   <a class="secondary button-link" href="{{ url_for('home') }}">Cancel</a>
 </div>
 
-{% if error %}<div class="route-result error">{{ error }}</div>{% endif %}
-
 <section class="panel setup-narrow">
-  <form method="post" action="{{ url_for('setup_search') }}" class="stack-form">
+  {% if error %}<div class="route-result error">{{ error }}</div>{% endif %}
+  <form method="post" class="stack-form">
     <label>
       Farm name
-      <input name="farm_name" value="{{ farm_name or '' }}" placeholder="Greenbank Farm" required autofocus>
+      <input name="farm_name" value="{{ farm_name }}" placeholder="Greenbank Farm" required autofocus>
     </label>
     <label>
       Postcode
-      <input name="postcode" value="{{ postcode or '' }}" placeholder="TD6 9XX" required>
+      <input name="postcode" value="{{ postcode }}" placeholder="TD6 9XX" required>
     </label>
-    <button class="primary large" type="submit">Find farm</button>
+    <button class="primary large" type="submit">Show satellite overview</button>
   </form>
 
   <div class="setup-note">
-    <strong>Cadastral data:</strong>
-    {% if data_status.ready %}
-      {{ data_status.files|length }} local dataset file{% if data_status.files|length != 1 %}s{% endif %} ready.
-    {% else %}
-      no local registry dataset loaded yet.
-      {% if demo_enabled %}Demo parcels are enabled for testing.{% endif %}
-    {% endif %}
+    The farm name does not need to match a database exactly. If Mapbox cannot find it, the postcode is used to get us into the right area.
   </div>
 </section>
 {% endblock %}

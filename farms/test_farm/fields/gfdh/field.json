@@ -1,7 +1,0 @@
-{
-  "name": "gfdh",
-  "boundary_source": "cv",
-  "boundary_locked": false,
-  "route_needs_regeneration": true,
-  "route_mode": "contour_straight"
-}

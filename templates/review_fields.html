@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Review fields · GPS Tractor{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <div class="eyebrow">Initial setup · 3 of 3</div>
+    <h1>{{ farm.name }}</h1>
+    <p>Review each field the CV found inside your selected farm area.</p>
+  </div>
+  <a class="secondary button-link" href="{{ url_for('farm_page', farm_id=farm.id) }}">Back to farm</a>
+</div>
+
+<div class="review-progress panel">
+  <strong>{{ counts.pending }} pending</strong>
+  <span>{{ counts.accepted }} accepted</span>
+  <span>{{ counts.rejected }} rejected</span>
+</div>
+
+{% if current %}
+<div class="setup-layout">
+  <section class="map-panel">
+    <img class="route-image" src="{{ url_for('candidate_overlay', farm_id=farm.id, candidate_id=current.id) }}" alt="Candidate field">
+  </section>
+  <aside class="tool-panel">
+    <div class="eyebrow">Detected field</div>
+    <h2>{{ current.suggested_name }}</h2>
+    <div class="metric"><span>Area</span><strong>{{ '%.1f'|format(current.area_ha) }} ha</strong></div>
+    <div class="metric"><span>SAM score</span><strong>{{ '%.2f'|format(current.sam_score) }}</strong></div>
+
+    <form method="post" action="{{ url_for('accept_candidate', farm_id=farm.id, candidate_id=current.id) }}" class="stack-form review-form">
+      <label>Field name<input name="field_name" value="{{ current.suggested_name }}"></label>
+      <button class="primary huge" type="submit">Keep field & review boundary</button>
+    </form>
+    <form method="post" action="{{ url_for('reject_candidate', farm_id=farm.id, candidate_id=current.id) }}">
+      <button class="secondary huge" type="submit">Not one of my fields</button>
+    </form>
+    <p class="muted small-copy">Keeping a field opens the existing boundary editor before its route is generated.</p>
+  </aside>
+</div>
+{% else %}
+<section class="panel">
+  <h2>Field review complete</h2>
+  <p>There are no pending candidates. Accepted fields are stored locally and can be edited or routed without repeating farm setup.</p>
+  <a class="primary button-link" href="{{ url_for('farm_page', farm_id=farm.id) }}">Open farm</a>
+</section>
+{% endif %}
+{% endblock %}

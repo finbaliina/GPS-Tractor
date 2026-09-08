@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Select farm area · GPS Tractor{% endblock %}
+{% block content %}
+<div class="page-header compact">
+  <div>
+    <div class="eyebrow">Initial setup · 2 of 3</div>
+    <h1>Select the land to scan</h1>
+    <p>{{ preview.location.farm_name }} · {{ preview.location.postcode }}</p>
+  </div>
+  <a class="secondary button-link" href="{{ url_for('setup_search') }}">Search again</a>
+</div>
+
+{% if error %}<div class="route-result error">{{ error }}</div>{% endif %}
+
+<div class="setup-layout">
+  <section class="map-panel">
+    <div id="farmAreaMap" class="map-wrap area-map-wrap">
+      <img
+        id="farmOverviewImage"
+        src="{{ url_for('setup_overview_image', preview_id=preview.id) }}"
+        alt="Satellite overview around the farm"
+        draggable="false"
+      >
+      <svg id="farmAreaSvg" class="boundary-svg area-select-svg"></svg>
+    </div>
+  </section>
+
+  <aside class="tool-panel">
+    <div class="eyebrow">Draw rough areas</div>
+    <h2>Cover all land you operate</h2>
+    <p class="muted">
+      Drag a box around the farm. If you have a detached block of land, just draw another box around that too.
+      It is better to include a little too much than cut a field off at the edge.
+    </p>
+
+    <div class="metric"><span>Overview width</span><strong>{{ '%.1f'|format(preview.map.approx_width_km) }} km</strong></div>
+    <div class="metric"><span>Overview height</span><strong>{{ '%.1f'|format(preview.map.approx_height_km) }} km</strong></div>
+    <div class="metric"><span>Areas selected</span><strong id="areaCount">0</strong></div>
+
+    <div class="tool-grid setup-actions">
+      <button id="undoArea" type="button" class="secondary">Undo last</button>
+      <button id="deleteArea" type="button" class="secondary">Delete selected</button>
+      <button id="clearAreas" type="button" class="danger-outline">Clear all</button>
+    </div>
+
+    <form id="farmAreaForm" method="post" action="{{ url_for('setup_complete', preview_id=preview.id) }}">
+      <input id="areasJson" type="hidden" name="areas_json" value="[]">
+      <button class="primary huge" type="submit">Use these areas</button>
+    </form>
+
+    <p class="muted small-copy">
+      The boxes are only a search region. CV will find the actual individual field boundaries from detailed imagery next.
+    </p>
+  </aside>
+</div>
+
+<script>
+window.FARM_AREA_CONFIG = {
+  width: {{ preview.map.width }},
+  height: {{ preview.map.height }}
+};
+</script>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='area_selector.js') }}"></script>
+{% endblock %}

@@ -311,7 +311,7 @@ label { display: flex; flex-direction: column; gap: 7px; font-weight: 650; }
   border-radius: 12px;
 }
 
-/* Initial cadastral farm setup */
+/* Farm setup: draw one or more rough search boxes */
 .setup-narrow { max-width: 650px; }
 .setup-note {
   margin-top: 20px;
@@ -326,18 +326,27 @@ label { display: flex; flex-direction: column; gap: 7px; font-weight: 650; }
   gap: 16px;
   align-items: start;
 }
-.candidate-parcel {
-  fill: rgba(250, 194, 36, .10);
-  stroke: rgba(255, 224, 88, .95);
-  stroke-width: 2.5;
+.area-map-wrap { cursor: crosshair; }
+.area-select-svg { touch-action: none; }
+.farm-area-rect {
+  fill: rgba(41, 214, 94, .16);
+  stroke: #2ee36c;
+  stroke-width: 3;
   vector-effect: non-scaling-stroke;
   cursor: pointer;
 }
-.candidate-parcel:hover { fill: rgba(250, 194, 36, .28); }
-.candidate-parcel.selected {
-  fill: rgba(41, 214, 94, .25);
-  stroke: #2ee36c;
+.farm-area-rect.selected {
+  fill: rgba(255, 224, 88, .22);
+  stroke: #ffe058;
   stroke-width: 4;
+}
+.farm-area-draft {
+  fill: rgba(255, 255, 255, .12);
+  stroke: white;
+  stroke-width: 3;
+  stroke-dasharray: 9 7;
+  vector-effect: non-scaling-stroke;
+  pointer-events: none;
 }
 .farm-search-point {
   fill: white;
@@ -348,6 +357,12 @@ label { display: flex; flex-direction: column; gap: 7px; font-weight: 650; }
 }
 .setup-actions { margin-top: 20px; }
 .small-copy { margin-top: 18px; font-size: 13px; line-height: 1.45; }
+.review-progress { display:flex; gap:24px; align-items:center; margin-bottom:18px; }
+.review-form { margin-top:18px; margin-bottom:10px; }
+.discovery-actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }
+.farm-setup-summary { display:flex; align-items:center; justify-content:space-between; gap:18px; }
+
 @media (max-width: 900px) {
   .setup-layout { grid-template-columns: 1fr; }
+  .farm-setup-summary { align-items:flex-start; flex-direction:column; }
 }

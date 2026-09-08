@@ -18,8 +18,9 @@ def regenerate_field_route(farm_id: str, field_id: str) -> dict:
     """
     Rebuild a field route using the farmer-approved boundary.
 
-    This does NOT call Mapbox or SAM.  It uses the satellite image, metadata and
-    terrain data already saved locally during setup.
+    This never calls SAM. If terrain has not yet been saved and internet is
+    available during setup, it can fetch terrain once; later regenerations use
+    the local terrain files. If terrain cannot be fetched, straight routing still works.
     """
     path = field_dir(farm_id, field_id)
 
@@ -59,6 +60,25 @@ def regenerate_field_route(farm_id: str, field_id: str) -> dict:
     use_contour = False
     terrain = None
     p90_slope = None
+
+    if (
+        not (terrain_data_path.exists() and terrain_json_path.exists())
+        and _env_bool("AUTO_FETCH_TERRAIN", True)
+        and os.getenv("MAPBOX_TOKEN", "").strip()
+    ):
+        try:
+            from terrain import get_terrain
+
+            capture = SimpleNamespace(
+                folder=path,
+                image_path=satellite_path,
+                metadata_path=metadata_path,
+                metres_per_pixel=metres_per_pixel,
+            )
+            print("UI route: fetching terrain for this field once during setup...")
+            get_terrain(capture, polygon)
+        except Exception as exc:
+            print(f"UI route: terrain fetch unavailable ({exc}); using straight routing if needed.")
 
     if terrain_data_path.exists() and terrain_json_path.exists():
         terrain = _load_saved_terrain(
@@ -200,3 +220,10 @@ def _mark_route_current(path: Path, route_mode: str) -> None:
         json.dumps(data, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
