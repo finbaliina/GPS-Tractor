@@ -19,6 +19,7 @@ from farm_data import (
     list_farms,
     reset_boundary,
     save_boundary,
+    save_field_obstacles,
 )
 from farm_setup import SETUP_CACHE, build_setup_preview, complete_setup, load_setup_preview
 from field_discovery import (
@@ -260,6 +261,13 @@ def accept_candidate(farm_id, candidate_id):
     return redirect(url_for("boundary_editor", farm_id=farm_id, field_id=field["id"]))
 
 
+@app.post("/farm/<farm_id>/candidate/<candidate_id>/accept-cv")
+def accept_candidate_cv_boundary(farm_id, candidate_id):
+    field_name = request.form.get("field_name", "")
+    approve_candidate(farm_id, candidate_id, field_name)
+    return redirect(url_for("review_fields", farm_id=farm_id))
+
+
 @app.post("/farm/<farm_id>/candidate/<candidate_id>/reject")
 def reject_candidate(farm_id, candidate_id):
     set_candidate_status(farm_id, candidate_id, "rejected")
@@ -345,6 +353,16 @@ def sequential_discovery_job_status(farm_id):
 
 @app.get("/farm/<farm_id>/sequential-fields")
 def sequential_fields(farm_id):
+    pool_path = FARMS_DIR / farm_id / "sequential_discovery" / "rough_pool.json"
+    if not pool_path.exists():
+        return _render_farm_page(
+            farm_id,
+            discovery_error=(
+                "Sequential discovery has not been prepared for this farm yet. "
+                "Click Start sequential scanner first."
+            ),
+        )
+
     current = get_next_sequential_candidate(farm_id)
     return render_template(
         "sequential_fields.html", farm=get_farm(farm_id), current=current,
@@ -362,6 +380,13 @@ def accept_sequential_field(farm_id):
     field_name = request.form.get("field_name", "")
     field = approve_sequential_candidate(farm_id, field_name)
     return redirect(url_for("boundary_editor", farm_id=farm_id, field_id=field["id"]))
+
+
+@app.post("/farm/<farm_id>/sequential-fields/current/accept-cv")
+def accept_sequential_cv_boundary(farm_id):
+    field_name = request.form.get("field_name", "")
+    approve_sequential_candidate(farm_id, field_name)
+    return redirect(url_for("sequential_fields", farm_id=farm_id))
 
 
 @app.post("/farm/<farm_id>/sequential-fields/current/reject")
@@ -384,10 +409,21 @@ def reset_sequential_fields(farm_id):
 
 @app.get("/farm/<farm_id>/field/<field_id>/edit")
 def boundary_editor(farm_id, field_id):
+    field = get_field(farm_id, field_id)
+
+    # Fields created during setup should return to the review queue they came
+    # from. Sequential and normal discovery use separate queues.
+    review_url = None
+    if field.get("source") == "sequential_field_discovery":
+        review_url = url_for("sequential_fields", farm_id=farm_id)
+    elif field.get("source_candidate"):
+        review_url = url_for("review_fields", farm_id=farm_id)
+
     return render_template(
         "boundary_editor.html",
         farm=get_farm(farm_id),
-        field=get_field(farm_id, field_id),
+        field=field,
+        review_url=review_url,
     )
 
 
@@ -421,6 +457,12 @@ def save_boundary_api(farm_id, field_id):
         points=boundary_points,
         source=boundary_source,
     )
+    if "obstacles" in request_payload:
+        save_field_obstacles(
+            farm_id=farm_id,
+            field_id=field_id,
+            obstacles=request_payload.get("obstacles", []),
+        )
     return jsonify({"ok": True, "points": boundary_points})
 
 
@@ -438,6 +480,29 @@ def regenerate_route_api(farm_id, field_id):
     except Exception as error:
         app.logger.exception("Route generation failed")
         return jsonify({"ok": False, "error": str(error)}), 500
+
+
+@app.post("/farm/<farm_id>/calculate-all-routes")
+def calculate_all_routes(farm_id):
+    farm = get_farm(farm_id)
+    failures = []
+    completed = 0
+    for field in farm.get("fields", []):
+        try:
+            regenerate_field_route(farm_id, field["id"])
+            completed += 1
+        except Exception as error:
+            app.logger.exception("Route generation failed for %s", field["id"])
+            failures.append(f"{field['name']}: {error}")
+
+    if failures:
+        message = (
+            f"Calculated routes for {completed} field(s). "
+            f"Could not calculate {len(failures)}: " + "; ".join(failures)
+        )
+        return _render_farm_page(farm_id, discovery_error=message, status_code=400)
+
+    return redirect(url_for("farm_page", farm_id=farm_id))
 
 
 @app.get("/farm/<farm_id>/field/<field_id>/drive")
@@ -468,6 +533,7 @@ def _render_farm_page(
         candidate_count=len(all_candidates),
         pending_candidate_count=pending_candidate_count,
         discovery_error=discovery_error,
+        sequential_ready=(FARMS_DIR / farm_id / "sequential_discovery" / "rough_pool.json").exists(),
     )
     return response, status_code
 

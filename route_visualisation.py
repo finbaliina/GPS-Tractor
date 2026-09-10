@@ -112,6 +112,16 @@ def _draw_geometry_outline(image, geometry, colour_bgr, line_thickness_px: int) 
             line_thickness_px,
             cv2.LINE_AA,
         )
+        for interior_ring in polygon.interiors:
+            interior_pixels = np.rint(np.asarray(interior_ring.coords)).astype(np.int32)
+            cv2.polylines(
+                image,
+                [interior_pixels],
+                True,
+                colour_bgr,
+                line_thickness_px,
+                cv2.LINE_AA,
+            )
 
 
 def _polygon_parts(geometry):

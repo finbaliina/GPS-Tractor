@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Review scanned fields · GPS Tractor{% endblock %}
+{% block title %}Review scanned fields · {{ farm.name }}{% endblock %}
 {% block content %}
 <div class="simple-header with-nav">
   <h1>Review scanned fields</h1>
@@ -7,33 +7,33 @@
 </div>
 
 {% if current %}
-<div class="setup-layout">
-  <section class="map-panel">
-    <img class="route-image" src="{{ url_for('candidate_overlay', farm_id=farm.id, candidate_id=current.id) }}" alt="Scanned field boundary">
+<div class="review-layout">
+  <section class="image-panel">
+    <img class="review-image" src="{{ url_for('sequential_candidate_overlay', farm_id=farm.id) }}?r={{ current.rough_id }}" alt="Scanned field boundary">
   </section>
   <aside class="tool-panel clean-review-panel">
     <h2>{{ current.suggested_name }}</h2>
     <div class="metric"><span>Area</span><strong>{{ '%.1f'|format(current.area_ha) }} ha</strong></div>
     <div class="metric"><span>Confidence</span><strong>{{ '%.0f'|format(current.sam_score * 100) }}%</strong></div>
 
-    <form method="post" action="{{ url_for('accept_candidate', farm_id=farm.id, candidate_id=current.id) }}" class="stack-form review-form">
+    <form method="post" action="{{ url_for('accept_sequential_field', farm_id=farm.id) }}" class="stack-form review-form">
       <label>Field name
         <input name="field_name" placeholder="{{ current.suggested_name }}" autocomplete="off">
       </label>
       <div class="action-grid review-action-grid">
         <button class="primary" type="submit">Edit boundary</button>
         <button class="secondary" type="submit"
-                formaction="{{ url_for('accept_candidate_cv_boundary', farm_id=farm.id, candidate_id=current.id) }}">
+                formaction="{{ url_for('accept_sequential_cv_boundary', farm_id=farm.id) }}">
           Accept boundary
         </button>
       </div>
     </form>
 
     <div class="action-grid review-action-grid">
-      <form method="post" action="{{ url_for('duplicate_candidate', farm_id=farm.id, candidate_id=current.id) }}">
+      <form method="post" action="{{ url_for('duplicate_sequential_field', farm_id=farm.id) }}">
         <button class="secondary" type="submit">Mark duplicate</button>
       </form>
-      <form method="post" action="{{ url_for('reject_candidate', farm_id=farm.id, candidate_id=current.id) }}">
+      <form method="post" action="{{ url_for('reject_sequential_field', farm_id=farm.id) }}">
         <button class="secondary" type="submit">Not my field</button>
       </form>
     </div>

@@ -363,6 +363,7 @@ def _refine_candidate(predictor, device_name: str, rough: RoughCandidate,
             choices, cfg.refinement_mask_score_tolerance
         )
 
+    refined_polygon = _clean_refined_boundary(refined_polygon)
     refined_polygon = _simplify_for_editing(refined_polygon)
     pixel_points = [list(_bng_to_pixel(e, n, image_map)) for e, n in refined_polygon.exterior.coords[:-1]]
     return RefinedCandidate(rough.geometry_bng, refined_polygon, refined_score,
@@ -382,6 +383,45 @@ def _contour_to_bng_polygon(contour: np.ndarray, map_image: MapImage) -> Polygon
         return clean_polygon(Polygon([_pixel_to_bng(x, y, map_image) for x, y in points]))
     except ValueError:
         return None
+
+
+def _clean_refined_boundary(field_polygon: Polygon) -> Polygon:
+    """Remove narrow SAM artefacts before reducing the boundary to editable vertices.
+
+    A positive then negative buffer is a geometric closing operation. It fills
+    narrow inward channels (the occasional deep SAM "fjord") without simply
+    increasing the simplification tolerance for the whole field. Small interior
+    holes are also discarded. All distances are in British National Grid metres.
+
+    Cleaning is deliberately fail-safe: if a geometry operation produces an
+    unusable polygon, the original repaired SAM polygon is returned.
+    """
+    cfg = settings.field_discovery
+
+    try:
+        original = clean_polygon(field_polygon)
+        cleaned = original
+
+        minimum_hole_area = cfg.refinement_minimum_hole_area_m2
+        if cleaned.interiors and minimum_hole_area > 0.0:
+            retained_holes = []
+            for interior in cleaned.interiors:
+                hole_polygon = Polygon(interior)
+                if hole_polygon.area >= minimum_hole_area:
+                    retained_holes.append(list(interior.coords))
+            cleaned = clean_polygon(Polygon(cleaned.exterior.coords, retained_holes))
+
+        clean_distance = cfg.refinement_boundary_clean_m
+        if clean_distance > 0.0:
+            # Mitre joins preserve the generally angular character of field corners.
+            closed = cleaned.buffer(clean_distance, join_style=2).buffer(
+                -clean_distance, join_style=2
+            )
+            cleaned = clean_polygon(closed)
+
+        return cleaned
+    except (ValueError, TypeError):
+        return clean_polygon(field_polygon)
 
 
 def _simplify_for_editing(field_polygon: Polygon) -> Polygon:

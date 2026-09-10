@@ -247,6 +247,46 @@ def delete_field(farm_id: str, field_id: str) -> None:
     field_directory = field_dir(farm_id, field_id)
     shutil.rmtree(field_directory)
 
+def load_field_obstacles(farm_id: str, field_id: str) -> list[dict[str, Any]]:
+    """Return saved route-exclusion shapes for a field."""
+    obstacle_path = field_dir(farm_id, field_id) / "field_obstacles.json"
+    if not obstacle_path.exists():
+        return []
+    data = read_json(obstacle_path)
+    obstacles = data.get("obstacles", []) if isinstance(data, dict) else []
+    return obstacles if isinstance(obstacles, list) else []
+
+
+def save_field_obstacles(
+    farm_id: str,
+    field_id: str,
+    obstacles: list[dict[str, Any]],
+) -> None:
+    """Persist farmer-drawn areas that tractor routes must avoid."""
+    cleaned_obstacles: list[dict[str, Any]] = []
+    for obstacle in obstacles:
+        if not isinstance(obstacle, dict):
+            continue
+        shape = obstacle.get("shape")
+        points = obstacle.get("points", [])
+        if shape not in {"circle", "square"} or not isinstance(points, list):
+            continue
+        cleaned_points = _strip_closed_coordinate(points)
+        if len(cleaned_points) < 3:
+            continue
+        cleaned_obstacles.append({"shape": shape, "points": cleaned_points})
+
+    write_json(
+        field_dir(farm_id, field_id) / "field_obstacles.json",
+        {"obstacles": cleaned_obstacles},
+    )
+
+    metadata_path = field_dir(farm_id, field_id) / "field.json"
+    field_metadata = read_json(metadata_path) if metadata_path.exists() else {"name": field_id}
+    field_metadata["route_needs_regeneration"] = True
+    write_json(metadata_path, field_metadata)
+
+
 def get_field(farm_id: str, field_id: str) -> dict[str, Any]:
     field_directory = field_dir(farm_id, field_id)
     metadata_path = field_directory / "field.json"
@@ -294,6 +334,8 @@ def get_field(farm_id: str, field_id: str) -> dict[str, Any]:
         "detected_points": detected_points,
         "route_ready": (field_directory / "route_plan.json").exists(),
         "source_candidate": field_metadata.get("source_candidate"),
+        "source": field_metadata.get("source"),
+        "obstacles": load_field_obstacles(farm_id, field_id),
     }
 
 

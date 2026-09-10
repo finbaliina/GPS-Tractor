@@ -423,3 +423,133 @@ label { display: flex; flex-direction: column; gap: 7px; font-weight: 650; }
   .review-progress { flex-wrap: wrap; gap: 10px 18px; }
   .review-secondary-actions { grid-template-columns: 1fr; }
 }
+
+/* Simplified farm navigation */
+.simple-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 24px;
+}
+.simple-header h1 { margin-bottom: 0; }
+.simple-header.with-nav { align-items: center; }
+
+.simple-section {
+  margin-bottom: 30px;
+}
+.simple-section > h2 {
+  margin-bottom: 12px;
+}
+.plain-copy {
+  color: #677168;
+  margin-bottom: 18px;
+}
+
+.action-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.action-grid.single-action {
+  grid-template-columns: minmax(0, 320px);
+}
+.action-grid > form,
+.action-grid > a,
+.action-grid > button {
+  width: 100%;
+  min-width: 0;
+}
+.action-grid form {
+  margin: 0;
+}
+.action-grid form button,
+.action-grid > a,
+.action-grid > button {
+  width: 100%;
+  min-height: 48px;
+  height: 48px;
+}
+.nav-button {
+  width: 160px;
+  min-height: 48px;
+}
+
+.farm-grid,
+.field-grid {
+  align-items: stretch;
+}
+.simple-card {
+  display: flex;
+  flex-direction: column;
+  min-height: 190px;
+}
+.simple-card .action-grid {
+  margin-top: auto;
+}
+.clean-field-card h2 {
+  margin-bottom: 0;
+}
+.field-actions {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: auto;
+}
+.field-actions form:last-child {
+  grid-column: 1 / -1;
+}
+.clean-review-panel .review-action-grid {
+  margin-top: 10px;
+}
+.clean-review-panel .review-form {
+  max-width: none;
+}
+
+@media (max-width: 650px) {
+  .simple-header.with-nav {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .nav-button { width: 100%; }
+  .action-grid,
+  .field-actions,
+  .review-action-grid {
+    grid-template-columns: 1fr;
+  }
+  .field-actions form:last-child { grid-column: auto; }
+  .action-grid.single-action { grid-template-columns: 1fr; }
+}
+
+/* Keep controls consistent across setup and editing screens too. */
+.equal-button-grid button,
+.tool-grid button,
+.bottom-actions button {
+  width: 100%;
+  min-height: 48px;
+  height: 48px;
+}
+.bottom-actions {
+  grid-template-columns: 1fr;
+}
+
+/* Farmer-drawn route exclusion areas */
+.boundary-svg.draw-mode { cursor: crosshair; }
+.exclusion-zone {
+  fill: rgba(188, 54, 43, .28);
+  stroke: #b83d32;
+  stroke-width: 3;
+  vector-effect: non-scaling-stroke;
+  cursor: pointer;
+}
+.exclusion-zone.selected {
+  fill: rgba(188, 54, 43, .42);
+  stroke: #76231d;
+  stroke-width: 5;
+}
+.exclusion-zone.draft {
+  fill: rgba(188, 54, 43, .18);
+  stroke-dasharray: 8 6;
+  pointer-events: none;
+}
+.saved-fields-main-action { margin-bottom: 16px; }
+.saved-fields-main-action form,
+.saved-fields-main-action button { width: 100%; }

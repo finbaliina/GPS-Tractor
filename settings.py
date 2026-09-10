@@ -188,6 +188,8 @@ class FieldDiscoverySettings:
     refinement_minimum_sam_score: float
     refinement_mask_score_tolerance: float
     refinement_minimum_rough_overlap_fraction: float
+    refinement_boundary_clean_m: float
+    refinement_minimum_hole_area_m2: float
     minimum_field_area_ha: float
     maximum_field_area_ha: float
     prefilter_minimum_area_ratio: float
@@ -359,6 +361,8 @@ def _build_settings() -> Settings:
             refinement_minimum_sam_score=_fraction("REFINEMENT_MIN_SAM_SCORE"),
             refinement_mask_score_tolerance=_fraction("REFINEMENT_MASK_SCORE_TOLERANCE"),
             refinement_minimum_rough_overlap_fraction=_fraction("REFINEMENT_MIN_ROUGH_OVERLAP"),
+            refinement_boundary_clean_m=_nonnegative_number("REFINEMENT_BOUNDARY_CLEAN_M"),
+            refinement_minimum_hole_area_m2=_nonnegative_number("REFINEMENT_MIN_HOLE_AREA_M2"),
             minimum_field_area_ha=field_minimum_area_ha,
             maximum_field_area_ha=field_maximum_area_ha,
             prefilter_minimum_area_ratio=prefilter_minimum_ratio,

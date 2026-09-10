@@ -255,3 +255,9 @@ The sequential branch:
 This is an experimental branch, not a replacement for the main scanner. Its main
 purpose is to test whether human decisions made one field at a time give cleaner
 farm setup than automatically refining a very large candidate list.
+
+## Field obstacles and bulk route calculation
+
+In the field editor, farmers can draw circular or square **avoid areas** around rocks, trees, wet patches or other obstacles. These are saved separately in `field_obstacles.json` and are cut out of the routeable field before route planning.
+
+The farm page also includes **Calculate all routes**, which regenerates routes for every saved field in that farm.

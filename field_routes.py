@@ -6,9 +6,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from shapely.geometry import Polygon
+from shapely.ops import unary_union
 
 from contour_planning import plan_contour_route, save_contour_route_plan
-from farm_data import field_dir, read_boundary_points
+from farm_data import field_dir, load_field_obstacles, read_boundary_points
 from geometry_utils import clean_polygon
 from json_io import read_json, write_json
 from mapbox import mapbox_token_is_configured
@@ -45,6 +46,11 @@ def regenerate_field_route(farm_id: str, field_id: str) -> dict:
         field_polygon = clean_polygon(Polygon(approved_points))
     except ValueError as exc:
         raise RuntimeError("Approved field boundary is not a usable polygon.") from exc
+
+    field_polygon = _apply_route_exclusions(
+        field_polygon,
+        load_field_obstacles(farm_id, field_id),
+    )
 
     metadata = read_json(metadata_path)
     image_metres_per_pixel = _metres_per_pixel_from_metadata(metadata)
@@ -86,6 +92,34 @@ def regenerate_field_route(farm_id: str, field_id: str) -> dict:
         "turns": int(route_plan.turns),
         "estimated_time_min": round(route_plan.estimated_time_s / 60.0, 1),
     }
+
+
+
+def _apply_route_exclusions(field_polygon: Polygon, obstacles: list[dict]) -> Polygon:
+    """Cut farmer-drawn obstacle areas out of the routeable field polygon."""
+    obstacle_polygons = []
+    for obstacle in obstacles:
+        points = obstacle.get("points", []) if isinstance(obstacle, dict) else []
+        if len(points) < 3:
+            continue
+        try:
+            obstacle_polygon = clean_polygon(Polygon(points))
+        except ValueError:
+            continue
+        clipped = obstacle_polygon.intersection(field_polygon)
+        if not clipped.is_empty:
+            obstacle_polygons.append(clipped)
+
+    if not obstacle_polygons:
+        return field_polygon
+
+    routeable_geometry = field_polygon.difference(unary_union(obstacle_polygons))
+    if routeable_geometry.is_empty:
+        raise RuntimeError("The drawn exclusion areas cover the whole field.")
+    try:
+        return clean_polygon(routeable_geometry)
+    except ValueError as exc:
+        raise RuntimeError("The drawn exclusion areas leave no usable routeable field area.") from exc
 
 
 def _fetch_terrain_if_needed(
