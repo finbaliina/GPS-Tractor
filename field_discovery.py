@@ -888,6 +888,7 @@ def approve_sequential_candidate(farm_id: str, field_name: str) -> dict[str, str
         "position": {"latitude": map_information["centre_lat"], "longitude": map_information["centre_lon"]},
         "zoom": map_information["zoom"], "width": map_information["width"], "height": map_information["height"],
         "image_settings": {"zoom": map_information["zoom"], "width": map_information["width"], "height": map_information["height"]},
+        "metres_per_pixel": metadata["metres_per_pixel"],
         "name": cleaned_name, "source": "sequential_field_discovery",
     })
     field_id = new_field_directory.name
