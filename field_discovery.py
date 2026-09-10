@@ -216,9 +216,35 @@ def _rough_candidate_at_prompt(predictor, device_name: str, overview: MapImage,
         choices.append((float(score), polygon))
     if not choices:
         return None
-    score, polygon = max(choices, key=lambda item: item[0])
+
+    # SAM commonly returns several valid interpretations for the same point.
+    # The highest-score mask can sometimes encompass a whole block of adjoining
+    # fields. Keep masks whose scores are close to the best result, then prefer
+    # the smallest plausible one. This biases discovery toward individual fields
+    # without accepting a clearly worse segmentation.
+    score, polygon = _prefer_individual_field_mask(
+        choices, cfg.discovery_mask_score_tolerance
+    )
     return RoughCandidate(polygon, score, overview, float(polygon.area))
 
+
+
+def _prefer_individual_field_mask(
+    choices: list[tuple[float, Polygon]], score_tolerance: float
+) -> tuple[float, Polygon]:
+    """Prefer an individual-field mask when SAM returns nested alternatives.
+
+    SAM's multimask output often contains a high-confidence broad region plus a
+    slightly lower-confidence mask around the actual prompted field. We retain
+    only masks close to the best confidence score, then take the smallest area.
+    """
+    best_score = max(score for score, _ in choices)
+    competitive = [
+        (score, polygon)
+        for score, polygon in choices
+        if score >= best_score - score_tolerance
+    ]
+    return min(competitive, key=lambda item: item[1].area)
 
 def _deduplicate_rough_candidates(candidates: list[RoughCandidate]) -> list[RoughCandidate]:
     ordered = sorted(candidates, key=lambda c: (-c.sam_score, -c.area_m2))
@@ -296,7 +322,9 @@ def _refine_candidate(predictor, device_name: str, rough: RoughCandidate,
         # Keep the rough geometry rather than losing a plausible field entirely.
         refined_score, refined_polygon = rough.sam_score, rough.geometry_bng
     else:
-        refined_score, refined_polygon = max(choices, key=lambda item: item[0])
+        refined_score, refined_polygon = _prefer_individual_field_mask(
+            choices, cfg.refinement_mask_score_tolerance
+        )
 
     refined_polygon = _simplify_for_editing(refined_polygon)
     pixel_points = [list(_bng_to_pixel(e, n, image_map)) for e, n in refined_polygon.exterior.coords[:-1]]

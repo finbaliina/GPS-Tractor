@@ -211,3 +211,19 @@ The cleaned project intentionally excludes:
 - virtual environments.
 
 The local `.env` is also ignored by Git because it contains the Mapbox token.
+
+### Field-mask tuning
+
+Whole-area discovery and close-up refinement now prefer the smallest SAM mask
+when several alternatives have very similar confidence scores. This is intended
+to reduce cases where adjoining fields are returned as one large mask.
+
+Tune with:
+
+- `DISCOVERY_MASK_SCORE_TOLERANCE` — Stage-1 overview selection.
+- `REFINEMENT_MASK_SCORE_TOLERANCE` — close-up selection.
+- `REFINEMENT_MAX_VERTICES` — maximum points shown in the boundary editor (15 by default).
+
+Increasing a mask-score tolerance makes the scanner more willing to choose a
+slightly lower-confidence, smaller mask. Reducing it makes SAM confidence more
+dominant.

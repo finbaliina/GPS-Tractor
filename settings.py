@@ -178,6 +178,7 @@ class FieldDiscoverySettings:
     discovery_prompt_spacing_m: float
     discovery_minimum_prompt_spacing_px: int
     discovery_minimum_sam_score: float
+    discovery_mask_score_tolerance: float
     refinement_image_width_px: int
     refinement_image_height_px: int
     refinement_target_metres_per_pixel: float
@@ -185,6 +186,7 @@ class FieldDiscoverySettings:
     refinement_minimum_margin_m: float
     refinement_box_padding_m: float
     refinement_minimum_sam_score: float
+    refinement_mask_score_tolerance: float
     refinement_minimum_rough_overlap_fraction: float
     minimum_field_area_ha: float
     maximum_field_area_ha: float
@@ -347,6 +349,7 @@ def _build_settings() -> Settings:
             discovery_prompt_spacing_m=_positive_number("DISCOVERY_PROMPT_SPACING_M"),
             discovery_minimum_prompt_spacing_px=_positive_integer("DISCOVERY_MIN_PROMPT_SPACING_PX"),
             discovery_minimum_sam_score=_fraction("DISCOVERY_MIN_SAM_SCORE"),
+            discovery_mask_score_tolerance=_fraction("DISCOVERY_MASK_SCORE_TOLERANCE"),
             refinement_image_width_px=_positive_integer("REFINEMENT_IMAGE_WIDTH"),
             refinement_image_height_px=_positive_integer("REFINEMENT_IMAGE_HEIGHT"),
             refinement_target_metres_per_pixel=_positive_number("REFINEMENT_MPP"),
@@ -354,6 +357,7 @@ def _build_settings() -> Settings:
             refinement_minimum_margin_m=_positive_number("REFINEMENT_MIN_MARGIN_M"),
             refinement_box_padding_m=_nonnegative_number("REFINEMENT_BOX_PADDING_M"),
             refinement_minimum_sam_score=_fraction("REFINEMENT_MIN_SAM_SCORE"),
+            refinement_mask_score_tolerance=_fraction("REFINEMENT_MASK_SCORE_TOLERANCE"),
             refinement_minimum_rough_overlap_fraction=_fraction("REFINEMENT_MIN_ROUGH_OVERLAP"),
             minimum_field_area_ha=field_minimum_area_ha,
             maximum_field_area_ha=field_maximum_area_ha,

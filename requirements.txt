@@ -7,8 +7,8 @@ numpy
 opencv-python
 shapely
 pyproj
-huggingface_hub
 matplotlib
-
-# PyTorch and SAM2 are installed separately because the correct PyTorch
-# build depends on whether this machine uses an NVIDIA GPU. See README.md.
+huggingface_hub
+torch
+torchvision
+git+https://github.com/facebookresearch/sam2.git
