@@ -2,16 +2,31 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import json
 import math
-import os
 
+import cv2
 import numpy as np
 from shapely import affinity
 from shapely.geometry import LineString, MultiLineString, Polygon
+from shapely.ops import unary_union
+
+from geometry_utils import clean_polygon
+from json_io import write_json
+from settings import settings
 
 
-@dataclass
+DIRECTION_PERIOD_DEG = 180.0
+MAXIMUM_DIRECTION_ERROR_DEG = 90.0
+ALIGNMENT_PENALTY_EXPONENT = 2.0
+SWATH_EXTENSION_SPACING_MULTIPLIER = 2.0
+MINIMUM_LINE_LENGTH_PX = 1e-6
+MINIMUM_VECTOR_NORM = 1e-12
+MINIMUM_COORDINATE_SPAN = 1e-9
+SQUARE_BUFFER_CAP_STYLE = 3
+MITRE_BUFFER_JOIN_STYLE = 2
+
+
+@dataclass(frozen=True)
 class ContourRoutePlan:
     working_polygon: Polygon
     swaths: list[LineString]
@@ -27,8 +42,21 @@ class ContourRoutePlan:
     mode: str = "contour_straight"
 
     @property
-    def total_distance_m(self):
-        return (self.working_distance_px + self.turn_distance_px) * self.metres_per_pixel
+    def total_distance_m(self) -> float:
+        total_distance_px = self.working_distance_px + self.turn_distance_px
+        return total_distance_px * self.metres_per_pixel
+
+
+@dataclass(frozen=True)
+class _ContourCandidate:
+    score: float
+    angle_deg: float
+    swaths: list[LineString]
+    working_distance_px: float
+    turn_distance_px: float
+    turns: int
+    estimated_time_s: float
+    alignment_error_deg: float
 
 
 def plan_contour_route(
@@ -36,460 +64,407 @@ def plan_contour_route(
     terrain,
     metres_per_pixel: float,
 ) -> ContourRoutePlan:
+    """Choose straight passes whose global heading best follows terrain contours.
+
+    The passes remain straight. Terrain only changes the preferred overall heading.
     """
-    Straight-line contour planner.
+    route_settings = settings.route
+    contour_settings = settings.contour_route
 
-    The passes themselves are always straight.
+    total_overlap_fraction = (
+        route_settings.pass_overlap_fraction
+        + contour_settings.extra_overlap_fraction
+    )
+    if total_overlap_fraction >= 1.0:
+        raise ValueError("Combined route overlap must remain below 1.0.")
 
-    The planner tests many possible straight-line headings and chooses the
-    heading which best follows the local equal-elevation direction across the
-    field, while still taking route length / number of turns into account.
+    pass_spacing_m = (
+        route_settings.implement_width_m * (1.0 - total_overlap_fraction)
+    )
+    pass_spacing_px = pass_spacing_m / metres_per_pixel
+    headland_width_px = route_settings.headland_width_m / metres_per_pixel
 
-    In other words:
-        terrain decides the best global direction;
-        implement width decides line spacing;
-        field polygon decides where each straight line starts and stops.
-    """
-    implement_m = float(os.getenv("IMPLEMENT_WIDTH_M", "6"))
-    headland_m = float(os.getenv("HEADLAND_WIDTH_M", "10"))
-    overlap = float(os.getenv("OVERLAP", "0.02"))
+    try:
+        working_polygon = clean_polygon(field.buffer(-headland_width_px))
+    except ValueError as exc:
+        raise RuntimeError("Headland is too wide for this field.") from exc
 
-    angle_step_deg = max(
-        0.5, float(os.getenv("CONTOUR_STRAIGHT_ANGLE_STEP_DEG", "1.0"))
+    elevation_grid = np.asarray(terrain.elevation_grid, dtype=np.float64)
+    slope_grid_deg = np.asarray(terrain.slope_grid_deg, dtype=np.float64)
+    terrain_image_x = np.asarray(terrain.image_x, dtype=np.float64)
+    terrain_image_y = np.asarray(terrain.image_y, dtype=np.float64)
+
+    if len(terrain_image_x) < 2 or len(terrain_image_y) < 2:
+        raise RuntimeError("Terrain grid is too small to determine contour direction.")
+
+    terrain_step_x_m = float(np.mean(np.diff(terrain_image_x))) * metres_per_pixel
+    terrain_step_y_m = float(np.mean(np.diff(terrain_image_y))) * metres_per_pixel
+    elevation_gradient_y, elevation_gradient_x = np.gradient(
+        elevation_grid,
+        terrain_step_y_m,
+        terrain_step_x_m,
     )
 
-    work_speed = float(os.getenv("WORKING_SPEED_MPS", "2.5"))
-    turn_speed = float(os.getenv("TURNING_SPEED_MPS", "1.5"))
-    fixed_turn_s = float(os.getenv("FIXED_TURN_TIME_S", "2"))
-
-    # How strongly terrain alignment matters relative to route efficiency.
-    # Higher = more willing to accept extra turns/distance to remain on contour.
-    alignment_weight = max(
-        0.0, float(os.getenv("CONTOUR_ALIGNMENT_WEIGHT", "8.0"))
+    working_area_mask = _rasterise_working_polygon(
+        working_polygon,
+        terrain_image_x=terrain_image_x,
+        terrain_image_y=terrain_image_y,
+        grid_shape=elevation_grid.shape,
     )
-
-    # Ignore nearly-flat DEM cells when deciding contour direction because
-    # their gradient direction is unstable/noisy.
-    min_gradient_slope_deg = max(
-        0.0, float(os.getenv("CONTOUR_DIRECTION_MIN_SLOPE_DEG", "1.0"))
+    reliable_terrain_mask = (
+        working_area_mask
+        & np.isfinite(elevation_gradient_x)
+        & np.isfinite(elevation_gradient_y)
+        & (slope_grid_deg >= contour_settings.minimum_direction_slope_deg)
     )
-
-    extra_overlap = max(
-        0.0,
-        min(0.50, float(os.getenv("CONTOUR_EXTRA_OVERLAP", "0.08")))
-    )
-    total_overlap = min(0.60, overlap + extra_overlap)
-
-    spacing_m = implement_m * (1.0 - total_overlap)
-    spacing_px = spacing_m / metres_per_pixel
-    headland_px = headland_m / metres_per_pixel
-
-    if spacing_px <= 0:
-        raise RuntimeError("Implement width / overlap produced invalid pass spacing.")
-
-    working = field.buffer(-headland_px)
-
-    if working.is_empty:
-        raise RuntimeError("Headland is too wide for this field.")
-
-    if working.geom_type == "MultiPolygon":
-        working = max(working.geoms, key=lambda p: p.area)
-
-    # Work out the local slope direction from the DEM.
-    elevation = np.asarray(terrain.elevation_grid, dtype=np.float64)
-    slope_grid = np.asarray(terrain.slope_grid_deg, dtype=np.float64)
-
-    image_x = np.asarray(terrain.image_x, dtype=np.float64)
-    image_y = np.asarray(terrain.image_y, dtype=np.float64)
-
-    dx_px = float(np.mean(np.diff(image_x))) if len(image_x) > 1 else 1.0
-    dy_px = float(np.mean(np.diff(image_y))) if len(image_y) > 1 else 1.0
-
-    dx_m = dx_px * metres_per_pixel
-    dy_m = dy_px * metres_per_pixel
-
-    dz_dy, dz_dx = np.gradient(elevation, dy_m, dx_m)
-
-    # Restrict terrain scoring to the working polygon.
-    mask = _working_mask(
-        working,
-        image_x=image_x,
-        image_y=image_y,
-        shape=elevation.shape,
-    )
-
-    useful = mask & np.isfinite(dz_dx) & np.isfinite(dz_dy)
-    useful &= slope_grid >= min_gradient_slope_deg
-
-    if not np.any(useful):
+    if not np.any(reliable_terrain_mask):
         raise RuntimeError(
             "Terrain is too flat to determine a reliable contour direction."
         )
 
-    best = None
-
-    for angle_deg in np.arange(0.0, 180.0, angle_step_deg):
-        swaths = _make_swaths(
-            working,
+    best_candidate: _ContourCandidate | None = None
+    for angle_deg in np.arange(
+        0.0,
+        DIRECTION_PERIOD_DEG,
+        contour_settings.angle_step_deg,
+    ):
+        candidate_swaths = _generate_swaths(
+            working_polygon,
             angle_deg=float(angle_deg),
-            spacing_px=spacing_px,
+            spacing_px=pass_spacing_px,
         )
-
-        if not swaths:
+        if not candidate_swaths:
             continue
 
-        swaths = _order_boustrophedon(swaths)
-
-        working_px = sum(line.length for line in swaths)
-        turn_px = sum(
-            math.dist(swaths[i].coords[-1], swaths[i + 1].coords[0])
-            for i in range(len(swaths) - 1)
-        )
-        turns = max(0, len(swaths) - 1)
-
-        estimated_time_s = (
-            working_px * metres_per_pixel / work_speed
-            + turn_px * metres_per_pixel / turn_speed
-            + turns * fixed_turn_s
-        )
-
-        alignment_error_deg = _contour_alignment_error(
+        ordered_swaths = _order_swaths_boustrophedon(candidate_swaths)
+        candidate = _evaluate_candidate(
             angle_deg=float(angle_deg),
-            dz_dx=dz_dx,
-            dz_dy=dz_dy,
-            useful_mask=useful,
+            swaths=ordered_swaths,
+            metres_per_pixel=metres_per_pixel,
+            elevation_gradient_x=elevation_gradient_x,
+            elevation_gradient_y=elevation_gradient_y,
+            reliable_terrain_mask=reliable_terrain_mask,
         )
+        if best_candidate is None or candidate.score < best_candidate.score:
+            best_candidate = candidate
 
-        # Convert the terrain error into a multiplier on route time.
-        #
-        # 0° error => no penalty.
-        # 90° error => maximum penalty.
-        alignment_fraction = alignment_error_deg / 90.0
-        score = estimated_time_s * (
-            1.0 + alignment_weight * alignment_fraction ** 2
-        )
-
-        candidate = {
-            "score": score,
-            "angle_deg": float(angle_deg),
-            "swaths": swaths,
-            "working_px": working_px,
-            "turn_px": turn_px,
-            "turns": turns,
-            "time_s": estimated_time_s,
-            "alignment_error_deg": alignment_error_deg,
-        }
-
-        if best is None or candidate["score"] < best["score"]:
-            best = candidate
-
-    if best is None:
+    if best_candidate is None:
         raise RuntimeError("No straight contour route could be generated.")
 
     coverage_percent = _coverage_percent(
-        working=working,
-        swaths=best["swaths"],
-        implement_width_px=implement_m / metres_per_pixel,
+        working_polygon=working_polygon,
+        swaths=best_candidate.swaths,
+        implement_width_px=route_settings.implement_width_m / metres_per_pixel,
     )
 
     print(
-        f"Straight contour route: {len(best['swaths'])} passes, "
-        f"{best['turns']} turns, "
-        f"{best['angle_deg']:.1f}°, "
-        f"mean contour-direction error {best['alignment_error_deg']:.1f}°, "
+        f"Straight contour route: {len(best_candidate.swaths)} passes, "
+        f"{best_candidate.turns} turns, "
+        f"{best_candidate.angle_deg:.1f}°, "
+        "mean contour-direction error "
+        f"{best_candidate.alignment_error_deg:.1f}°, "
         f"{coverage_percent:.2f}% working-area coverage, "
-        f"about {best['time_s'] / 60:.1f} min"
+        f"about {best_candidate.estimated_time_s / 60.0:.1f} min"
     )
 
     return ContourRoutePlan(
-        working_polygon=working,
-        swaths=best["swaths"],
+        working_polygon=working_polygon,
+        swaths=best_candidate.swaths,
         metres_per_pixel=metres_per_pixel,
-        working_distance_px=best["working_px"],
-        turn_distance_px=best["turn_px"],
-        turns=best["turns"],
-        estimated_time_s=best["time_s"],
-        pass_spacing_m=spacing_m,
+        working_distance_px=best_candidate.working_distance_px,
+        turn_distance_px=best_candidate.turn_distance_px,
+        turns=best_candidate.turns,
+        estimated_time_s=best_candidate.estimated_time_s,
+        pass_spacing_m=pass_spacing_m,
         coverage_percent=coverage_percent,
-        angle_deg=best["angle_deg"],
-        contour_alignment_error_deg=best["alignment_error_deg"],
+        angle_deg=best_candidate.angle_deg,
+        contour_alignment_error_deg=best_candidate.alignment_error_deg,
     )
 
 
-def save_contour_route_plan(plan: ContourRoutePlan, path: Path):
-    path.write_text(
-        json.dumps(
-            {
-                "mode": plan.mode,
-                "angle_deg": plan.angle_deg,
-                "passes": len(plan.swaths),
-                "turns": plan.turns,
-                "pass_spacing_m": plan.pass_spacing_m,
-                "coverage_percent": plan.coverage_percent,
-                "mean_contour_direction_error_deg": plan.contour_alignment_error_deg,
-                "working_distance_m": plan.working_distance_px * plan.metres_per_pixel,
-                "turn_distance_m": plan.turn_distance_px * plan.metres_per_pixel,
-                "total_distance_m": plan.total_distance_m,
-                "estimated_time_min": plan.estimated_time_s / 60,
-                "swaths_pixels": [
-                    [[float(x), float(y)] for x, y in line.coords]
-                    for line in plan.swaths
-                ],
-            },
-            indent=2,
-        ) + "\n",
-        encoding="utf-8",
+def _evaluate_candidate(
+    angle_deg: float,
+    swaths: list[LineString],
+    metres_per_pixel: float,
+    elevation_gradient_x: np.ndarray,
+    elevation_gradient_y: np.ndarray,
+    reliable_terrain_mask: np.ndarray,
+) -> _ContourCandidate:
+    route_settings = settings.route
+    contour_settings = settings.contour_route
+
+    working_distance_px = sum(swath.length for swath in swaths)
+    turn_distance_px = sum(
+        math.dist(current.coords[-1], following.coords[0])
+        for current, following in zip(swaths, swaths[1:])
+    )
+    turn_count = max(0, len(swaths) - 1)
+    estimated_time_s = (
+        working_distance_px
+        * metres_per_pixel
+        / route_settings.working_speed_mps
+        + turn_distance_px
+        * metres_per_pixel
+        / route_settings.turning_speed_mps
+        + turn_count * route_settings.fixed_turn_time_s
+    )
+
+    alignment_error_deg = _contour_alignment_error(
+        angle_deg=angle_deg,
+        elevation_gradient_x=elevation_gradient_x,
+        elevation_gradient_y=elevation_gradient_y,
+        reliable_terrain_mask=reliable_terrain_mask,
+    )
+    alignment_fraction = alignment_error_deg / MAXIMUM_DIRECTION_ERROR_DEG
+    route_score = estimated_time_s * (
+        1.0
+        + contour_settings.alignment_weight
+        * alignment_fraction**ALIGNMENT_PENALTY_EXPONENT
+    )
+
+    return _ContourCandidate(
+        score=route_score,
+        angle_deg=angle_deg,
+        swaths=swaths,
+        working_distance_px=working_distance_px,
+        turn_distance_px=turn_distance_px,
+        turns=turn_count,
+        estimated_time_s=estimated_time_s,
+        alignment_error_deg=alignment_error_deg,
     )
 
 
-def _make_swaths(
-    working: Polygon,
+def save_contour_route_plan(plan: ContourRoutePlan, path: Path) -> None:
+    write_json(
+        path,
+        {
+            "mode": plan.mode,
+            "angle_deg": plan.angle_deg,
+            "passes": len(plan.swaths),
+            "turns": plan.turns,
+            "pass_spacing_m": plan.pass_spacing_m,
+            "coverage_percent": plan.coverage_percent,
+            "mean_contour_direction_error_deg": plan.contour_alignment_error_deg,
+            "working_distance_m": plan.working_distance_px * plan.metres_per_pixel,
+            "turn_distance_m": plan.turn_distance_px * plan.metres_per_pixel,
+            "total_distance_m": plan.total_distance_m,
+            "estimated_time_min": plan.estimated_time_s / 60.0,
+            "swaths_pixels": [
+                [[float(x), float(y)] for x, y in swath.coords]
+                for swath in plan.swaths
+            ],
+        },
+    )
+
+
+def _generate_swaths(
+    working_polygon: Polygon,
     angle_deg: float,
     spacing_px: float,
 ) -> list[LineString]:
-    """
-    Rotate the field so candidate passes are horizontal, slice it with evenly
-    spaced straight lines, then rotate the clipped passes back.
-    """
-    centre = working.centroid
-
-    rotated = affinity.rotate(
-        working,
+    """Rotate, slice with straight lines, then rotate clipped swaths back."""
+    field_centre = working_polygon.centroid
+    rotated_polygon = affinity.rotate(
+        working_polygon,
         -angle_deg,
-        origin=(centre.x, centre.y),
+        origin=(field_centre.x, field_centre.y),
         use_radians=False,
     )
+    minimum_x, minimum_y, maximum_x, maximum_y = rotated_polygon.bounds
 
-    minx, miny, maxx, maxy = rotated.bounds
+    swath_y = minimum_y + spacing_px / 2.0
+    line_extension_px = (
+        max(maximum_x - minimum_x, maximum_y - minimum_y)
+        + spacing_px * SWATH_EXTENSION_SPACING_MULTIPLIER
+    )
+    rotated_swaths: list[LineString] = []
 
-    # Start half a spacing inside the lower bound. This gives implement coverage
-    # roughly half a width beyond the first/last centreline.
-    y = miny + spacing_px / 2.0
+    while swath_y <= maximum_y:
+        cutting_line = LineString(
+            [
+                (minimum_x - line_extension_px, swath_y),
+                (maximum_x + line_extension_px, swath_y),
+            ]
+        )
+        clipped_geometry = cutting_line.intersection(rotated_polygon)
+        rotated_swaths.extend(
+            line_part
+            for line_part in _line_parts(clipped_geometry)
+            if line_part.length > MINIMUM_LINE_LENGTH_PX
+        )
+        swath_y += spacing_px
 
-    swaths_rotated = []
-
-    margin = max(maxx - minx, maxy - miny) + spacing_px * 2
-
-    while y <= maxy:
-        candidate = LineString([
-            (minx - margin, y),
-            (maxx + margin, y),
-        ])
-
-        clipped = candidate.intersection(rotated)
-
-        for part in _line_parts(clipped):
-            if part.length > 1e-6:
-                swaths_rotated.append(part)
-
-        y += spacing_px
-
-    swaths = [
+    return [
         affinity.rotate(
-            line,
+            swath,
             angle_deg,
-            origin=(centre.x, centre.y),
+            origin=(field_centre.x, field_centre.y),
             use_radians=False,
         )
-        for line in swaths_rotated
+        for swath in rotated_swaths
     ]
 
-    return swaths
 
-
-def _order_boustrophedon(lines: list[LineString]) -> list[LineString]:
-    """
-    Order passes spatially, then alternate direction so the tractor works
-    backwards and forwards across the field.
-    """
-    if not lines:
+def _order_swaths_boustrophedon(swaths: list[LineString]) -> list[LineString]:
+    """Order parallel lines spatially and alternate travel direction."""
+    if not swaths:
         return []
 
-    # A robust ordering for straight, parallel lines is by centroid position
-    # along the normal direction to the line family.
-    first = lines[0]
-    x1, y1 = first.coords[0]
-    x2, y2 = first.coords[-1]
+    first_swath = swaths[0]
+    first_start_x, first_start_y = first_swath.coords[0]
+    first_end_x, first_end_y = first_swath.coords[-1]
+    direction_x = first_end_x - first_start_x
+    direction_y = first_end_y - first_start_y
+    direction_length = math.hypot(direction_x, direction_y)
+    if direction_length < MINIMUM_COORDINATE_SPAN:
+        return swaths
 
-    dx = x2 - x1
-    dy = y2 - y1
-    norm = math.hypot(dx, dy)
-
-    if norm < 1e-9:
-        return lines
-
-    # Unit normal.
-    nx = -dy / norm
-    ny = dx / norm
-
-    ordered = sorted(
-        lines,
-        key=lambda line: line.centroid.x * nx + line.centroid.y * ny,
+    normal_x = -direction_y / direction_length
+    normal_y = direction_x / direction_length
+    spatially_ordered_swaths = sorted(
+        swaths,
+        key=lambda swath: (
+            swath.centroid.x * normal_x + swath.centroid.y * normal_y
+        ),
     )
 
-    result = []
+    ordered_swaths: list[LineString] = []
+    for swath_index, swath in enumerate(spatially_ordered_swaths):
+        coordinates = list(swath.coords)
 
-    for i, line in enumerate(ordered):
-        coords = list(line.coords)
-
-        # Give the first pass a deterministic left-to-right-ish direction.
-        if i == 0:
-            if coords[0][0] > coords[-1][0]:
-                coords.reverse()
+        if swath_index == 0:
+            if coordinates[0][0] > coordinates[-1][0]:
+                coordinates.reverse()
         else:
-            previous_end = result[-1].coords[-1]
+            previous_end = ordered_swaths[-1].coords[-1]
+            distance_to_start = math.dist(previous_end, coordinates[0])
+            distance_to_end = math.dist(previous_end, coordinates[-1])
+            if distance_to_end < distance_to_start:
+                coordinates.reverse()
 
-            d_start = math.dist(previous_end, coords[0])
-            d_end = math.dist(previous_end, coords[-1])
+        ordered_swaths.append(LineString(coordinates))
 
-            if d_end < d_start:
-                coords.reverse()
-
-        result.append(LineString(coords))
-
-    return result
+    return ordered_swaths
 
 
 def _contour_alignment_error(
     angle_deg: float,
-    dz_dx: np.ndarray,
-    dz_dy: np.ndarray,
-    useful_mask: np.ndarray,
+    elevation_gradient_x: np.ndarray,
+    elevation_gradient_y: np.ndarray,
+    reliable_terrain_mask: np.ndarray,
 ) -> float:
-    """
-    Return mean angular error between the proposed STRAIGHT pass direction and
-    the local equal-elevation direction.
+    """Return mean angle between a proposed pass and local equal-elevation direction."""
+    candidate_angle_rad = math.radians(angle_deg)
+    candidate_direction_x = math.cos(candidate_angle_rad)
+    candidate_direction_y = math.sin(candidate_angle_rad)
 
-    Gradient points uphill.
-    A contour is perpendicular to gradient.
+    gradient_x = elevation_gradient_x[reliable_terrain_mask]
+    gradient_y = elevation_gradient_y[reliable_terrain_mask]
+    gradient_magnitude = np.hypot(gradient_x, gradient_y)
+    nonzero_gradient = gradient_magnitude > MINIMUM_VECTOR_NORM
+    if not np.any(nonzero_gradient):
+        return MAXIMUM_DIRECTION_ERROR_DEG
 
-    Because a tractor line has no preferred forward/backward orientation,
-    0° and 180° are equivalent.
-    """
-    theta = math.radians(angle_deg)
+    unit_gradient_x = gradient_x[nonzero_gradient] / gradient_magnitude[nonzero_gradient]
+    unit_gradient_y = gradient_y[nonzero_gradient] / gradient_magnitude[nonzero_gradient]
 
-    # Candidate pass direction in image coordinates.
-    ux = math.cos(theta)
-    uy = math.sin(theta)
+    # Equal-elevation direction is perpendicular to the uphill gradient.
+    contour_direction_x = -unit_gradient_y
+    contour_direction_y = unit_gradient_x
+    absolute_dot_product = np.abs(
+        contour_direction_x * candidate_direction_x
+        + contour_direction_y * candidate_direction_y
+    )
+    absolute_dot_product = np.clip(absolute_dot_product, 0.0, 1.0)
+    angular_errors_deg = np.degrees(np.arccos(absolute_dot_product))
 
-    gx = dz_dx[useful_mask]
-    gy = dz_dy[useful_mask]
-
-    gnorm = np.hypot(gx, gy)
-    valid = gnorm > 1e-12
-
-    if not np.any(valid):
-        return 90.0
-
-    gx = gx[valid] / gnorm[valid]
-    gy = gy[valid] / gnorm[valid]
-
-    # Contour direction = gradient rotated by 90 degrees.
-    cx = -gy
-    cy = gx
-
-    dot = np.abs(cx * ux + cy * uy)
-    dot = np.clip(dot, 0.0, 1.0)
-
-    errors = np.degrees(np.arccos(dot))
-
-    # Weight steeper cells more strongly because contour direction matters
-    # more there and gradient direction is more reliable.
-    weights = gnorm[valid]
-    weights = weights / max(float(np.mean(weights)), 1e-12)
-
-    return float(np.average(errors, weights=weights))
+    # Steeper cells carry more weight because both the direction estimate and the
+    # agricultural importance of contour-following are stronger there.
+    gradient_weights = gradient_magnitude[nonzero_gradient]
+    mean_gradient_weight = max(
+        float(np.mean(gradient_weights)),
+        MINIMUM_VECTOR_NORM,
+    )
+    normalised_weights = gradient_weights / mean_gradient_weight
+    return float(np.average(angular_errors_deg, weights=normalised_weights))
 
 
-def _working_mask(
-    working: Polygon,
-    image_x: np.ndarray,
-    image_y: np.ndarray,
-    shape: tuple[int, int],
+def _rasterise_working_polygon(
+    working_polygon: Polygon,
+    terrain_image_x: np.ndarray,
+    terrain_image_y: np.ndarray,
+    grid_shape: tuple[int, int],
 ) -> np.ndarray:
-    """
-    Rasterise the working polygon onto the terrain grid.
-    Uses point-in-polygon through OpenCV-compatible pixel conversion.
-    """
-    import cv2
+    grid_height, grid_width = grid_shape
+    mask = np.zeros((grid_height, grid_width), dtype=np.uint8)
 
-    grid_h, grid_w = shape
-    mask = np.zeros((grid_h, grid_w), dtype=np.uint8)
+    image_x_minimum = float(terrain_image_x[0])
+    image_x_maximum = float(terrain_image_x[-1])
+    image_y_minimum = float(terrain_image_y[0])
+    image_y_maximum = float(terrain_image_y[-1])
+    scale_x = (grid_width - 1) / max(
+        image_x_maximum - image_x_minimum,
+        MINIMUM_COORDINATE_SPAN,
+    )
+    scale_y = (grid_height - 1) / max(
+        image_y_maximum - image_y_minimum,
+        MINIMUM_COORDINATE_SPAN,
+    )
 
-    x0, x1 = float(image_x[0]), float(image_x[-1])
-    y0, y1 = float(image_y[0]), float(image_y[-1])
+    polygons = (
+        [working_polygon]
+        if working_polygon.geom_type == "Polygon"
+        else list(working_polygon.geoms)
+    )
+    for polygon in polygons:
+        exterior_points = np.asarray(polygon.exterior.coords, dtype=float).copy()
+        exterior_points[:, 0] = (
+            exterior_points[:, 0] - image_x_minimum
+        ) * scale_x
+        exterior_points[:, 1] = (
+            exterior_points[:, 1] - image_y_minimum
+        ) * scale_y
+        cv2.fillPoly(mask, [np.rint(exterior_points).astype(np.int32)], 1)
 
-    sx = (grid_w - 1) / max(x1 - x0, 1e-9)
-    sy = (grid_h - 1) / max(y1 - y0, 1e-9)
-
-    polygons = [working] if working.geom_type == "Polygon" else list(working.geoms)
-
-    for poly in polygons:
-        exterior = np.asarray(poly.exterior.coords, dtype=float).copy()
-        exterior[:, 0] = (exterior[:, 0] - x0) * sx
-        exterior[:, 1] = (exterior[:, 1] - y0) * sy
-
-        cv2.fillPoly(
-            mask,
-            [np.rint(exterior).astype(np.int32)],
-            1,
-        )
-
-        for ring in poly.interiors:
-            hole = np.asarray(ring.coords, dtype=float).copy()
-            hole[:, 0] = (hole[:, 0] - x0) * sx
-            hole[:, 1] = (hole[:, 1] - y0) * sy
-
-            cv2.fillPoly(
-                mask,
-                [np.rint(hole).astype(np.int32)],
-                0,
-            )
+        for interior_ring in polygon.interiors:
+            hole_points = np.asarray(interior_ring.coords, dtype=float).copy()
+            hole_points[:, 0] = (hole_points[:, 0] - image_x_minimum) * scale_x
+            hole_points[:, 1] = (hole_points[:, 1] - image_y_minimum) * scale_y
+            cv2.fillPoly(mask, [np.rint(hole_points).astype(np.int32)], 0)
 
     return mask.astype(bool)
 
 
 def _coverage_percent(
-    working: Polygon,
+    working_polygon: Polygon,
     swaths: list[LineString],
     implement_width_px: float,
 ) -> float:
-    from shapely.ops import unary_union
-
-    if working.area <= 0 or not swaths:
+    if working_polygon.area <= 0.0 or not swaths:
         return 0.0
 
-    half_width = implement_width_px / 2.0
-
-    strips = [
-        line.buffer(
-            half_width,
-            cap_style=3,
-            join_style=2,
+    half_implement_width_px = implement_width_px / 2.0
+    covered_strips = [
+        swath.buffer(
+            half_implement_width_px,
+            cap_style=SQUARE_BUFFER_CAP_STYLE,
+            join_style=MITRE_BUFFER_JOIN_STYLE,
         )
-        for line in swaths
+        for swath in swaths
     ]
-
-    covered = unary_union(strips).intersection(working)
-
-    return float(100.0 * covered.area / working.area)
+    covered_area = unary_union(covered_strips).intersection(working_polygon)
+    return float(100.0 * covered_area.area / working_polygon.area)
 
 
-def _line_parts(geometry):
+def _line_parts(geometry) -> list[LineString]:
     if geometry.is_empty:
         return []
-
     if isinstance(geometry, LineString):
         return [geometry]
-
     if isinstance(geometry, MultiLineString):
         return list(geometry.geoms)
-
     if hasattr(geometry, "geoms"):
         return [
-            part
-            for part in geometry.geoms
-            if isinstance(part, LineString)
+            part for part in geometry.geoms if isinstance(part, LineString)
         ]
-
     return []

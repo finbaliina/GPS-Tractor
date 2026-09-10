@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import json
-import os
+import threading
 import webbrowser
 
-from dotenv import load_dotenv
 from flask import Flask, jsonify, redirect, render_template, request, send_file, url_for
-
-load_dotenv()
 
 from farm_data import (
     FARMS_DIR,
@@ -22,13 +19,14 @@ from farm_data import (
     save_boundary,
 )
 from farm_setup import SETUP_CACHE, build_setup_preview, complete_setup, load_setup_preview
-from field_routes import regenerate_field_route
 from field_discovery import (
     approve_candidate,
     discover_fields,
     list_candidates,
     set_candidate_status,
 )
+from field_routes import regenerate_field_route
+from settings import settings
 
 
 app = Flask(__name__)
@@ -39,11 +37,11 @@ def home():
     return render_template("home.html", farms=list_farms())
 
 
-# Kept as a small development/escape hatch. Normal users should use /setup.
+# Small development escape hatch. Normal setup should start at /setup.
 @app.post("/farms")
 def new_farm():
-    name = request.form.get("name", "")
-    farm = create_farm(name)
+    farm_name = request.form.get("name", "")
+    farm = create_farm(farm_name)
     return redirect(url_for("farm_page", farm_id=farm["id"]))
 
 
@@ -59,113 +57,115 @@ def setup_search():
 
     farm_name = request.form.get("farm_name", "")
     postcode = request.form.get("postcode", "")
-    try:
-        preview = build_setup_preview(farm_name, postcode)
-    except Exception as exc:
-        app.logger.exception("Farm setup lookup failed")
-        return render_template(
-            "setup_search.html",
-            error=str(exc),
-            farm_name=farm_name,
-            postcode=postcode,
-        ), 400
 
-    return redirect(url_for("setup_area", preview_id=preview["id"]))
+    try:
+        setup_preview = build_setup_preview(farm_name, postcode)
+    except Exception as error:
+        app.logger.exception("Farm setup lookup failed")
+        return (
+            render_template(
+                "setup_search.html",
+                error=str(error),
+                farm_name=farm_name,
+                postcode=postcode,
+            ),
+            400,
+        )
+
+    return redirect(url_for("setup_area", preview_id=setup_preview["id"]))
 
 
 @app.get("/setup/<preview_id>/area")
 def setup_area(preview_id):
-    preview = load_setup_preview(preview_id)
-    return render_template("setup_area.html", preview=preview, error=None)
+    setup_preview = load_setup_preview(preview_id)
+    return render_template("setup_area.html", preview=setup_preview, error=None)
 
 
 @app.get("/setup/<preview_id>/overview.png")
 def setup_overview_image(preview_id):
-    preview = load_setup_preview(preview_id)  # validates ID before constructing path
-    _ = preview
-    path = SETUP_CACHE / preview_id / "overview.png"
-    return send_file(path)
+    load_setup_preview(preview_id)  # Validate the ID before constructing the path.
+    return send_file(SETUP_CACHE / preview_id / "overview.png")
 
 
 @app.post("/setup/<preview_id>/complete")
 def setup_complete(preview_id):
-    raw = request.form.get("areas_json", "[]")
+    encoded_areas = request.form.get("areas_json", "[]")
+
     try:
-        rectangles = json.loads(raw)
-        if not isinstance(rectangles, list):
+        selected_rectangles = json.loads(encoded_areas)
+        if not isinstance(selected_rectangles, list):
             raise ValueError("Selected areas are not in the expected format.")
-        farm = complete_setup(preview_id, rectangles)
-    except Exception as exc:
+        farm = complete_setup(preview_id, selected_rectangles)
+    except Exception as error:
         app.logger.exception("Completing farm setup failed")
-        return render_template(
-            "setup_area.html",
-            preview=load_setup_preview(preview_id),
-            error=str(exc),
-        ), 400
+        return (
+            render_template(
+                "setup_area.html",
+                preview=load_setup_preview(preview_id),
+                error=str(error),
+            ),
+            400,
+        )
 
     return redirect(url_for("farm_page", farm_id=farm["id"]))
 
 
 @app.get("/farm/<farm_id>")
 def farm_page(farm_id):
-    farm = get_farm(farm_id)
-    candidates = list_candidates(farm_id)
-    pending = sum(1 for c in candidates if c.get("status", "pending") == "pending")
-    return render_template(
-        "farm.html",
-        farm=farm,
-        captures=list_capture_candidates(),
-        candidate_count=len(candidates),
-        pending_candidate_count=pending,
-    )
+    return _render_farm_page(farm_id)
 
 
 @app.post("/farm/<farm_id>/discover-fields")
 def discover_farm_fields(farm_id):
     try:
-        discover_fields(farm_id, force=request.form.get("force") == "1")
-    except Exception as exc:
+        force_rescan = request.form.get("force") == "1"
+        discover_fields(farm_id, force=force_rescan)
+    except Exception as error:
         app.logger.exception("Field discovery failed")
-        candidates = list_candidates(farm_id)
-        return render_template(
-            "farm.html",
-            farm=get_farm(farm_id),
-            captures=list_capture_candidates(),
-            candidate_count=len(candidates),
-            pending_candidate_count=sum(
-                1 for c in candidates if c.get("status", "pending") == "pending"
-            ),
-            discovery_error=str(exc),
-        ), 500
+        return _render_farm_page(farm_id, discovery_error=str(error), status_code=500)
+
     return redirect(url_for("review_fields", farm_id=farm_id))
 
 
 @app.get("/farm/<farm_id>/review-fields")
 def review_fields(farm_id):
-    candidates = list_candidates(farm_id)
-    pending = [c for c in candidates if c.get("status", "pending") == "pending"]
-    counts = {
-        "pending": len(pending),
-        "accepted": sum(1 for c in candidates if c.get("status") == "accepted"),
-        "rejected": sum(1 for c in candidates if c.get("status") == "rejected"),
+    all_candidates = list_candidates(farm_id)
+    pending_candidates = [
+        candidate
+        for candidate in all_candidates
+        if candidate.get("status", "pending") == "pending"
+    ]
+
+    status_counts = {
+        "pending": len(pending_candidates),
+        "accepted": sum(
+            candidate.get("status") == "accepted" for candidate in all_candidates
+        ),
+        "rejected": sum(
+            candidate.get("status") == "rejected" for candidate in all_candidates
+        ),
     }
+
     return render_template(
         "review_fields.html",
         farm=get_farm(farm_id),
-        current=pending[0] if pending else None,
-        counts=counts,
+        current=pending_candidates[0] if pending_candidates else None,
+        counts=status_counts,
     )
 
 
 @app.get("/farm/<farm_id>/candidate/<candidate_id>/overlay.png")
 def candidate_overlay(farm_id, candidate_id):
-    path = FARMS_DIR / farm_id / "field_candidates" / candidate_id / "overlay.png"
-    return send_file(path)
+    overlay_path = (
+        FARMS_DIR / farm_id / "field_candidates" / candidate_id / "overlay.png"
+    )
+    return send_file(overlay_path)
 
 
 @app.post("/farm/<farm_id>/candidate/<candidate_id>/accept")
 def accept_candidate(farm_id, candidate_id):
-    field = approve_candidate(farm_id, candidate_id, request.form.get("field_name", ""))
+    field_name = request.form.get("field_name", "")
+    field = approve_candidate(farm_id, candidate_id, field_name)
     return redirect(url_for("boundary_editor", farm_id=farm_id, field_id=field["id"]))
 
 
@@ -180,9 +180,7 @@ def add_field(farm_id):
     capture_id = request.form.get("capture_id", "")
     field_name = request.form.get("field_name", "")
     field = import_capture_as_field(farm_id, capture_id, field_name)
-    return redirect(
-        url_for("boundary_editor", farm_id=farm_id, field_id=field["id"])
-    )
+    return redirect(url_for("boundary_editor", farm_id=farm_id, field_id=field["id"]))
 
 
 @app.get("/farm/<farm_id>/field/<field_id>/edit")
@@ -201,10 +199,10 @@ def field_satellite(farm_id, field_id):
 
 @app.get("/farm/<farm_id>/field/<field_id>/route_overlay.png")
 def field_route_overlay(farm_id, field_id):
-    path = field_dir(farm_id, field_id) / "route_overlay.png"
-    if not path.exists():
-        return ("Route not generated", 404)
-    return send_file(path)
+    route_overlay_path = field_dir(farm_id, field_id) / "route_overlay.png"
+    if not route_overlay_path.exists():
+        return "Route not generated", 404
+    return send_file(route_overlay_path)
 
 
 @app.get("/api/farm/<farm_id>/field/<field_id>")
@@ -214,27 +212,33 @@ def field_api(farm_id, field_id):
 
 @app.post("/api/farm/<farm_id>/field/<field_id>/boundary")
 def save_boundary_api(farm_id, field_id):
-    payload = request.get_json(force=True)
-    points = payload.get("points", [])
-    source = payload.get("source", "manual_edit")
-    save_boundary(farm_id=farm_id, field_id=field_id, points=points, source=source)
-    return jsonify({"ok": True, "points": points})
+    request_payload = request.get_json(force=True)
+    boundary_points = request_payload.get("points", [])
+    boundary_source = request_payload.get("source", "manual_edit")
+
+    save_boundary(
+        farm_id=farm_id,
+        field_id=field_id,
+        points=boundary_points,
+        source=boundary_source,
+    )
+    return jsonify({"ok": True, "points": boundary_points})
 
 
 @app.post("/api/farm/<farm_id>/field/<field_id>/boundary/reset")
 def reset_boundary_api(farm_id, field_id):
-    points = reset_boundary(farm_id, field_id)
-    return jsonify({"ok": True, "points": points})
+    boundary_points = reset_boundary(farm_id, field_id)
+    return jsonify({"ok": True, "points": boundary_points})
 
 
 @app.post("/api/farm/<farm_id>/field/<field_id>/route")
 def regenerate_route_api(farm_id, field_id):
     try:
-        result = regenerate_field_route(farm_id, field_id)
-        return jsonify(result)
-    except Exception as exc:
+        route_result = regenerate_field_route(farm_id, field_id)
+        return jsonify(route_result)
+    except Exception as error:
         app.logger.exception("Route generation failed")
-        return jsonify({"ok": False, "error": str(exc)}), 500
+        return jsonify({"ok": False, "error": str(error)}), 500
 
 
 @app.get("/farm/<farm_id>/field/<field_id>/drive")
@@ -246,20 +250,47 @@ def drive_preview(farm_id, field_id):
     )
 
 
-def main():
-    port = int(os.getenv("GPS_TRACTOR_UI_PORT", "5000"))
-    url = f"http://127.0.0.1:{port}"
+def _render_farm_page(
+    farm_id: str,
+    discovery_error: str | None = None,
+    status_code: int = 200,
+):
+    """Build the farm page context in one place."""
+    all_candidates = list_candidates(farm_id)
+    pending_candidate_count = sum(
+        candidate.get("status", "pending") == "pending"
+        for candidate in all_candidates
+    )
+
+    response = render_template(
+        "farm.html",
+        farm=get_farm(farm_id),
+        captures=list_capture_candidates(),
+        candidate_count=len(all_candidates),
+        pending_candidate_count=pending_candidate_count,
+        discovery_error=discovery_error,
+    )
+    return response, status_code
+
+
+def main() -> None:
+    ui_settings = settings.ui
+    local_url = f"http://{ui_settings.host}:{ui_settings.port}"
 
     print("\nGPS Tractor UI")
-    print(f"Open: {url}\n")
+    print(f"Open: {local_url}\n")
 
-    if os.getenv("GPS_TRACTOR_OPEN_BROWSER", "true").lower() in {"1", "true", "yes"}:
-        import threading
-        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+    if ui_settings.open_browser:
+        browser_timer = threading.Timer(
+            ui_settings.browser_open_delay_s,
+            lambda: webbrowser.open(local_url),
+        )
+        browser_timer.daemon = True
+        browser_timer.start()
 
     app.run(
-        host="127.0.0.1",
-        port=port,
+        host=ui_settings.host,
+        port=ui_settings.port,
         debug=False,
         use_reloader=False,
     )

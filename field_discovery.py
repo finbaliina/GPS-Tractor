@@ -1,16 +1,16 @@
+"""Two-stage automatic field discovery for farmer-selected search areas.
+
+Stage 1 downloads one overview satellite image for each selected search-area
+polygon and uses SAM2 to find rough field candidates with full-area context.
+Stage 2 downloads a dedicated high-resolution image around each rough candidate
+and runs SAM2 again to produce the boundary shown to the farmer.
+
+There is deliberately no imagery tiling or stitching here. If a selected area is
+too large for useful discovery, the farmer can scan a smaller box separately.
+"""
 from __future__ import annotations
 
-"""Discover field candidates inside the farmer's selected farm area.
-
-The farm area is created once during setup by drawing one or more boxes on a
-zoomed-out satellite image.  This module downloads detailed imagery for that
-area, runs SAM2, deduplicates overlapping detections and stores a review queue.
-"""
-
 from dataclasses import dataclass
-import json
-import math
-import os
 from pathlib import Path
 import shutil
 from typing import Any
@@ -18,405 +18,427 @@ from typing import Any
 import cv2
 import numpy as np
 from pyproj import Transformer
-from shapely.geometry import Point, Polygon, box, mapping, shape
+from shapely.geometry import Point, Polygon, mapping, shape
 from shapely.ops import transform
 
-from farm_data import FARMS_DIR, _unique_dir, slugify, write_boundary_points_compatible
-from farm_setup import fetch_mapbox_satellite
+from farm_data import FARMS_DIR, slugify, unique_directory, write_boundary_points_compatible
+from geometry_utils import clean_polygon
+from json_io import read_json, write_json
+from mapbox import fetch_satellite_image, metres_per_pixel, zoom_for_metres_per_pixel
+from sam_utils import create_image_predictor, predict_masks
+from settings import settings
+
+SQUARE_METRES_PER_HECTARE = 10_000.0
+WGS84_EPSG = 4326
+BRITISH_NATIONAL_GRID_EPSG = 27700
 
 
-EARTH_CIRCUMFERENCE_M = 40075016.68557849
-MAPBOX_TILE_SIZE = 512
-
-
-@dataclass
-class TileInfo:
-    id: str
-    centre_x: float
-    centre_y: float
-    centre_lon: float
-    centre_lat: float
+@dataclass(frozen=True)
+class MapImage:
+    image_id: str
+    centre_easting_m: float
+    centre_northing_m: float
+    centre_longitude_deg: float
+    centre_latitude_deg: float
     zoom: float
-    width: int
-    height: int
+    width_px: int
+    height_px: int
     metres_per_pixel: float
-    path: Path
+    image_path: Path
+
+
+@dataclass(frozen=True)
+class RoughCandidate:
+    geometry_bng: Polygon
+    sam_score: float
+    source_image: MapImage
+    area_m2: float
+
+
+@dataclass(frozen=True)
+class RefinedCandidate:
+    discovery_geometry_bng: Polygon
+    geometry_bng: Polygon
+    sam_score: float
+    refinement_image: MapImage
+    pixel_points: list[list[float]]
+    area_m2: float
 
 
 def discover_fields(farm_id: str, force: bool = False) -> dict[str, Any]:
-    farm_dir = FARMS_DIR / farm_id
-    search_path = farm_dir / "farm_search_area.geojson"
-    if not search_path.exists():
+    """Find and refine fields in the farm's saved search area."""
+    farm_directory = FARMS_DIR / farm_id
+    search_area_path = farm_directory / "farm_search_area.geojson"
+    if not search_area_path.exists():
         raise FileNotFoundError("This farm has no saved search area. Run farm setup first.")
 
-    candidate_root = farm_dir / "field_candidates"
-    if force and candidate_root.exists():
-        shutil.rmtree(candidate_root)
-    candidate_root.mkdir(exist_ok=True)
+    candidate_directory = farm_directory / "field_candidates"
+    if force:
+        shutil.rmtree(candidate_directory, ignore_errors=True)
+        shutil.rmtree(farm_directory / "discovery_overviews", ignore_errors=True)
+    candidate_directory.mkdir(exist_ok=True)
 
-    existing = list_candidates(farm_id)
-    if existing and not force:
-        return {"ok": True, "candidate_count": len(existing), "reused": True}
+    existing_candidates = list_candidates(farm_id)
+    if existing_candidates and not force:
+        return {"ok": True, "candidate_count": len(existing_candidates), "reused": True}
 
-    search_geom_wgs = shape(json.loads(search_path.read_text(encoding="utf-8"))["geometry"])
-    if search_geom_wgs.is_empty:
+    search_geometry_wgs84 = shape(read_json(search_area_path)["geometry"])
+    if search_geometry_wgs84.is_empty:
         raise RuntimeError("The saved farm search area is empty.")
 
-    to_bng = Transformer.from_crs(4326, 27700, always_xy=True)
-    to_wgs = Transformer.from_crs(27700, 4326, always_xy=True)
-    search = transform(to_bng.transform, search_geom_wgs)
+    wgs84_to_bng = Transformer.from_crs(WGS84_EPSG, BRITISH_NATIONAL_GRID_EPSG, always_xy=True)
+    bng_to_wgs84 = Transformer.from_crs(BRITISH_NATIONAL_GRID_EPSG, WGS84_EPSG, always_xy=True)
+    search_geometry_bng = transform(wgs84_to_bng.transform, search_geometry_wgs84)
 
-    width = int(os.getenv("FIELD_DISCOVERY_IMAGE_SIZE", "1000"))
-    height = width
-    target_mpp = float(os.getenv("FIELD_DISCOVERY_MPP", "0.8"))
-    overlap = float(os.getenv("FIELD_DISCOVERY_TILE_OVERLAP", "0.12"))
-    context_buffer_m = float(os.getenv("FIELD_DISCOVERY_CONTEXT_BUFFER_M", "120"))
-    tile_span_m = width * target_mpp
-    step_m = tile_span_m * (1.0 - overlap)
-    max_tiles = int(os.getenv("FIELD_DISCOVERY_MAX_TILES", "180"))
+    search_parts = _polygon_parts(search_geometry_bng)
+    overview_images = [
+        _build_overview_image(farm_directory, part, index, bng_to_wgs84)
+        for index, part in enumerate(search_parts, start=1)
+    ]
 
-    # A small imagery-only buffer helps SAM see the full boundary of fields that
-    # lie on the edge of the farmer's rough box.  Prompt points remain inside the
-    # actual selected area.
-    tile_search = search.buffer(context_buffer_m)
-    minx, miny, maxx, maxy = tile_search.bounds
+    predictor, device_name = create_image_predictor()
+    rough_candidates: list[RoughCandidate] = []
+    for index, (overview, search_part) in enumerate(zip(overview_images, search_parts), start=1):
+        print(f"Rough field discovery {index}/{len(overview_images)}: {overview.image_id}")
+        rough_candidates.extend(
+            _discover_in_overview(predictor, device_name, overview, search_part)
+        )
+    rough_candidates = _deduplicate_rough_candidates(rough_candidates)
 
-    x_values = _centres_covering(minx, maxx, tile_span_m, step_m)
-    y_values = _centres_covering(miny, maxy, tile_span_m, step_m)
+    print(f"Rough discovery found {len(rough_candidates)} candidate fields. Refining...")
+    refined_candidates: list[RefinedCandidate] = []
+    for index, rough_candidate in enumerate(rough_candidates, start=1):
+        print(f"Refining field {index}/{len(rough_candidates)}...")
+        refined = _refine_candidate(
+            predictor, device_name, rough_candidate, farm_directory, index, bng_to_wgs84
+        )
+        if refined is not None:
+            refined_candidates.append(refined)
 
-    tiles: list[TileInfo] = []
-    tile_dir = farm_dir / "discovery_tiles"
-    if force and tile_dir.exists():
-        shutil.rmtree(tile_dir)
-    tile_dir.mkdir(exist_ok=True)
-
-    for y in y_values:
-        for x in x_values:
-            footprint = box(
-                x - tile_span_m / 2,
-                y - tile_span_m / 2,
-                x + tile_span_m / 2,
-                y + tile_span_m / 2,
-            )
-            if not footprint.intersects(tile_search):
-                continue
-            if len(tiles) >= max_tiles:
-                raise RuntimeError(
-                    f"The selected area needs more than {max_tiles} detailed imagery tiles. "
-                    "Draw tighter farm boxes, increase FIELD_DISCOVERY_MAX_TILES, or increase "
-                    "FIELD_DISCOVERY_MPP slightly."
-                )
-
-            lon, lat = to_wgs.transform(float(x), float(y))
-            zoom = _zoom_for_mpp(lat, target_mpp)
-            mpp = _mpp(lat, zoom)
-            tile_id = f"tile_{len(tiles) + 1:03d}"
-            path = tile_dir / f"{tile_id}.png"
-            if not path.exists():
-                print(f"Downloading field discovery tile {len(tiles) + 1}...")
-                fetch_mapbox_satellite(lat, lon, zoom, width, height, path)
-
-            tiles.append(
-                TileInfo(tile_id, x, y, lon, lat, zoom, width, height, mpp, path)
-            )
-
-    print(f"Running field detection across {len(tiles)} detailed imagery tiles...")
-    raw = _run_sam_on_tiles(tiles, search)
-    deduped = _dedupe(raw)
-    _save_candidates(farm_id, deduped, candidate_root, to_wgs)
-
+    _save_candidate_queue(refined_candidates, candidate_directory, bng_to_wgs84)
     summary = {
         "ok": True,
-        "candidate_count": len(deduped),
-        "tile_count": len(tiles),
+        "candidate_count": len(refined_candidates),
+        "rough_candidate_count": len(rough_candidates),
+        "overview_image_count": len(overview_images),
         "reused": False,
+        "architecture": "whole_area_then_per_field_refinement",
     }
-    (farm_dir / "field_discovery.json").write_text(
-        json.dumps(summary, indent=2) + "\n", encoding="utf-8"
-    )
+    write_json(farm_directory / "field_discovery.json", summary)
     return summary
 
 
-def _centres_covering(minimum: float, maximum: float, span: float, step: float) -> np.ndarray:
-    start = minimum + span / 2.0
-    if maximum - minimum <= span:
-        return np.array([(minimum + maximum) / 2.0])
-    return np.arange(start, maximum + span / 2.0, step)
+def _polygon_parts(geometry) -> list[Polygon]:
+    if geometry.geom_type == "Polygon":
+        return [clean_polygon(geometry)]
+    if geometry.geom_type == "MultiPolygon":
+        return [clean_polygon(part) for part in geometry.geoms if not part.is_empty]
+    cleaned = clean_polygon(geometry)
+    return [cleaned]
 
 
-def _run_sam_on_tiles(tiles: list[TileInfo], search) -> list[dict[str, Any]]:
-    import torch
-    from sam2.build_sam import build_sam2_hf
-    from sam2.sam2_image_predictor import SAM2ImagePredictor
+def _build_overview_image(
+    farm_directory: Path,
+    search_polygon: Polygon,
+    index: int,
+    bng_to_wgs84: Transformer,
+) -> MapImage:
+    cfg = settings.field_discovery
+    buffered = search_polygon.buffer(cfg.discovery_context_margin_m)
+    min_e, min_n, max_e, max_n = buffered.bounds
+    centre_e = (min_e + max_e) / 2.0
+    centre_n = (min_n + max_n) / 2.0
+    centre_lon, centre_lat = bng_to_wgs84.transform(centre_e, centre_n)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model_id = os.getenv("SAM_MODEL", "facebook/sam2.1-hiera-tiny")
-    predictor = SAM2ImagePredictor(build_sam2_hf(model_id, device=device))
-
-    spacing_m = float(os.getenv("FIELD_DISCOVERY_PROMPT_SPACING_M", "120"))
-    min_area_m2 = float(os.getenv("FIELD_MIN_AREA_HA", "0.35")) * 10000.0
-    max_area_m2 = float(os.getenv("FIELD_MAX_AREA_HA", "250")) * 10000.0
-    simplify_m = float(os.getenv("FIELD_DISCOVERY_SIMPLIFY_M", "2.0"))
-    min_score = float(os.getenv("FIELD_DISCOVERY_MIN_SAM_SCORE", "0.60"))
-    min_overlap = float(os.getenv("FIELD_DISCOVERY_MIN_AREA_OVERLAP", "0.35"))
-    results: list[dict[str, Any]] = []
-
-    for tile_index, tile in enumerate(tiles, start=1):
-        print(f"SAM tile {tile_index}/{len(tiles)}: {tile.id}")
-        image = cv2.imread(str(tile.path))
-        if image is None:
-            continue
-        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        predictor.set_image(rgb)
-        prompt_px = max(40, int(round(spacing_m / tile.metres_per_pixel)))
-
-        for py in range(prompt_px // 2, tile.height, prompt_px):
-            for px in range(prompt_px // 2, tile.width, prompt_px):
-                bx = tile.centre_x + (px - tile.width / 2) * tile.metres_per_pixel
-                by = tile.centre_y - (py - tile.height / 2) * tile.metres_per_pixel
-                if not search.covers(Point(bx, by)):
-                    continue
-
-                coords = np.array([[px, py]], dtype=np.float32)
-                labels = np.array([1], dtype=np.int32)
-                with torch.inference_mode():
-                    if device == "cuda":
-                        with torch.autocast("cuda", dtype=torch.float16):
-                            masks, scores, _ = predictor.predict(
-                                point_coords=coords,
-                                point_labels=labels,
-                                multimask_output=True,
-                            )
-                    else:
-                        masks, scores, _ = predictor.predict(
-                            point_coords=coords,
-                            point_labels=labels,
-                            multimask_output=True,
-                        )
-
-                choices = []
-                for i, mask in enumerate(masks):
-                    if mask[int(py), int(px)]:
-                        choices.append((np.count_nonzero(mask), i))
-                if not choices:
-                    continue
-
-                _, idx = max(choices)
-                score = float(scores[idx])
-                if score < min_score:
-                    continue
-
-                mask = masks[idx].astype(np.uint8)
-                contours, _ = cv2.findContours(
-                    mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-                )
-                if not contours:
-                    continue
-                contour = max(contours, key=cv2.contourArea)
-                eps = max(1.0, simplify_m / tile.metres_per_pixel)
-                contour = cv2.approxPolyDP(contour, eps, True)
-                pts = contour[:, 0, :].astype(float)
-                if len(pts) < 3:
-                    continue
-
-                bng_pts = [
-                    [
-                        tile.centre_x + (x - tile.width / 2) * tile.metres_per_pixel,
-                        tile.centre_y - (y - tile.height / 2) * tile.metres_per_pixel,
-                    ]
-                    for x, y in pts
-                ]
-                geom = Polygon(bng_pts)
-                if not geom.is_valid:
-                    geom = geom.buffer(0)
-                if geom.is_empty or geom.geom_type not in {"Polygon", "MultiPolygon"}:
-                    continue
-                if geom.geom_type == "MultiPolygon":
-                    geom = max(geom.geoms, key=lambda g: g.area)
-
-                area = float(geom.area)
-                if area < min_area_m2 or area > max_area_m2:
-                    continue
-
-                overlap_share = geom.intersection(search).area / max(area, 1.0)
-                if overlap_share < min_overlap:
-                    continue
-
-                min_px = np.min(pts, axis=0)
-                max_px = np.max(pts, axis=0)
-                edge_margin_px = float(
-                    min(min_px[0], min_px[1], tile.width - max_px[0], tile.height - max_px[1])
-                )
-
-                results.append({
-                    "geometry_bng": geom,
-                    "score": score,
-                    "tile": tile,
-                    "pixel_points": pts.tolist(),
-                    "area_m2": area,
-                    "edge_margin_px": edge_margin_px,
-                })
-
-    return results
-
-
-def _dedupe(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    threshold = float(os.getenv("FIELD_DEDUP_IOU", "0.55"))
-
-    # Prefer detections that sit comfortably inside a tile; they are less likely
-    # to be clipped at an imagery edge.  Score and area break ties.
-    items = sorted(
-        items,
-        key=lambda x: (-x["edge_margin_px"], -x["score"], -x["area_m2"]),
+    required_mpp = max(
+        (max_e - min_e) / cfg.discovery_image_width_px,
+        (max_n - min_n) / cfg.discovery_image_height_px,
     )
-    kept: list[dict[str, Any]] = []
-    for item in items:
-        geom = item["geometry_bng"]
-        duplicate = False
-        for other in kept:
-            inter = geom.intersection(other["geometry_bng"]).area
-            union = geom.union(other["geometry_bng"]).area
-            if union and inter / union >= threshold:
-                duplicate = True
-                break
-        if not duplicate:
-            kept.append(item)
-
-    # Make the review order stable and roughly largest-first.
-    return sorted(kept, key=lambda x: -x["area_m2"])
-
-
-def _save_candidates(
-    farm_id: str,
-    items: list[dict[str, Any]],
-    root: Path,
-    to_wgs: Transformer,
-) -> None:
-    for i, item in enumerate(items, start=1):
-        cid = f"candidate_{i:03d}"
-        d = root / cid
-        d.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(item["tile"].path, d / "satellite.png")
-
-        points = item["pixel_points"]
-        write_boundary_points_compatible(d / "field_boundary.json", points)
-        write_boundary_points_compatible(d / "field_boundary_detected.json", points)
-
-        geom_wgs = transform(to_wgs.transform, item["geometry_bng"])
-        meta = {
-            "id": cid,
-            "status": "pending",
-            "suggested_name": f"Field {i}",
-            "sam_score": item["score"],
-            "area_ha": item["area_m2"] / 10000.0,
-            "context": "inside selected farm area",
-            "source_tile": item["tile"].id,
-            "metres_per_pixel": item["tile"].metres_per_pixel,
-            "map": {
-                "centre_lat": item["tile"].centre_lat,
-                "centre_lon": item["tile"].centre_lon,
-                "zoom": item["tile"].zoom,
-                "width": item["tile"].width,
-                "height": item["tile"].height,
-            },
-            "geometry_wgs84": mapping(geom_wgs),
-        }
-        (d / "candidate.json").write_text(
-            json.dumps(meta, indent=2) + "\n", encoding="utf-8"
+    zoom = max(1.0, min(18.0, zoom_for_metres_per_pixel(centre_lat, required_mpp)))
+    actual_mpp = metres_per_pixel(centre_lat, zoom)
+    image_id = f"overview_{index:02d}"
+    image_path = farm_directory / "discovery_overviews" / f"{image_id}.png"
+    if not image_path.exists():
+        fetch_satellite_image(
+            latitude_deg=centre_lat,
+            longitude_deg=centre_lon,
+            zoom=zoom,
+            width_px=cfg.discovery_image_width_px,
+            height_px=cfg.discovery_image_height_px,
+            destination=image_path,
         )
+    return MapImage(image_id, centre_e, centre_n, centre_lon, centre_lat, zoom,
+                    cfg.discovery_image_width_px, cfg.discovery_image_height_px,
+                    actual_mpp, image_path)
 
-        image = cv2.imread(str(d / "satellite.png"))
-        contour = np.array(points, dtype=np.int32).reshape((-1, 1, 2))
-        cv2.polylines(image, [contour], True, (0, 255, 0), 4, cv2.LINE_AA)
-        cv2.imwrite(str(d / "overlay.png"), image)
+
+def _discover_in_overview(predictor, device_name: str, overview: MapImage, search_polygon: Polygon) -> list[RoughCandidate]:
+    image = cv2.imread(str(overview.image_path))
+    if image is None:
+        raise RuntimeError(f"Could not read discovery image {overview.image_path}")
+    predictor.set_image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    cfg = settings.field_discovery
+    spacing_px = max(cfg.discovery_minimum_prompt_spacing_px,
+                     int(round(cfg.discovery_prompt_spacing_m / overview.metres_per_pixel)))
+    candidates: list[RoughCandidate] = []
+    for y in range(spacing_px // 2, overview.height_px, spacing_px):
+        for x in range(spacing_px // 2, overview.width_px, spacing_px):
+            easting, northing = _pixel_to_bng(x, y, overview)
+            if not search_polygon.covers(Point(easting, northing)):
+                continue
+            candidate = _rough_candidate_at_prompt(predictor, device_name, overview, search_polygon, x, y)
+            if candidate is not None:
+                candidates.append(candidate)
+    return candidates
+
+
+def _rough_candidate_at_prompt(predictor, device_name: str, overview: MapImage,
+                               search_polygon: Polygon, x: int, y: int) -> RoughCandidate | None:
+    cfg = settings.field_discovery
+    points = np.array([[x, y]], dtype=np.float32)
+    labels = np.array([1], dtype=np.int32)
+    masks, scores, _ = predict_masks(predictor, device_name, points, labels, multiple_masks=True)
+    min_area = cfg.minimum_field_area_ha * SQUARE_METRES_PER_HECTARE * cfg.prefilter_minimum_area_ratio
+    max_area = cfg.maximum_field_area_ha * SQUARE_METRES_PER_HECTARE * cfg.prefilter_maximum_area_ratio
+    choices: list[tuple[float, Polygon]] = []
+    for mask, score in zip(masks, scores):
+        if not mask[y, x] or float(score) < cfg.discovery_minimum_sam_score:
+            continue
+        contour = _largest_mask_contour(mask)
+        if contour is None:
+            continue
+        polygon = _contour_to_bng_polygon(contour, overview)
+        if polygon is None or not min_area <= polygon.area <= max_area:
+            continue
+        overlap = polygon.intersection(search_polygon).area / max(polygon.area, 1.0)
+        if overlap < cfg.minimum_search_overlap_fraction:
+            continue
+        choices.append((float(score), polygon))
+    if not choices:
+        return None
+    score, polygon = max(choices, key=lambda item: item[0])
+    return RoughCandidate(polygon, score, overview, float(polygon.area))
+
+
+def _deduplicate_rough_candidates(candidates: list[RoughCandidate]) -> list[RoughCandidate]:
+    ordered = sorted(candidates, key=lambda c: (-c.sam_score, -c.area_m2))
+    kept: list[RoughCandidate] = []
+    threshold = settings.field_discovery.deduplication_iou_threshold
+    for candidate in ordered:
+        if any(_intersection_over_union(candidate.geometry_bng, other.geometry_bng) >= threshold for other in kept):
+            continue
+        kept.append(candidate)
+    return sorted(kept, key=lambda c: -c.area_m2)
+
+
+def _refine_candidate(predictor, device_name: str, rough: RoughCandidate,
+                      farm_directory: Path, index: int,
+                      bng_to_wgs84: Transformer) -> RefinedCandidate | None:
+    cfg = settings.field_discovery
+    min_e, min_n, max_e, max_n = rough.geometry_bng.bounds
+    field_width = max_e - min_e
+    field_height = max_n - min_n
+    margin_m = max(cfg.refinement_minimum_margin_m,
+                   max(field_width, field_height) * cfg.refinement_margin_fraction)
+    min_e -= margin_m; min_n -= margin_m; max_e += margin_m; max_n += margin_m
+    centre_e = (min_e + max_e) / 2.0
+    centre_n = (min_n + max_n) / 2.0
+    centre_lon, centre_lat = bng_to_wgs84.transform(centre_e, centre_n)
+    required_mpp = max((max_e-min_e)/cfg.refinement_image_width_px,
+                       (max_n-min_n)/cfg.refinement_image_height_px)
+    target_mpp = max(required_mpp, cfg.refinement_target_metres_per_pixel)
+    zoom = max(1.0, min(18.0, zoom_for_metres_per_pixel(centre_lat, target_mpp)))
+    actual_mpp = metres_per_pixel(centre_lat, zoom)
+    image_path = farm_directory / "field_refinement" / f"candidate_{index:03d}.png"
+    fetch_satellite_image(centre_lat, centre_lon, zoom,
+                          cfg.refinement_image_width_px, cfg.refinement_image_height_px, image_path)
+    image_map = MapImage(f"refinement_{index:03d}", centre_e, centre_n, centre_lon, centre_lat,
+                         zoom, cfg.refinement_image_width_px, cfg.refinement_image_height_px,
+                         actual_mpp, image_path)
+    image = cv2.imread(str(image_path))
+    if image is None:
+        return None
+    predictor.set_image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+
+    representative = rough.geometry_bng.representative_point()
+    px, py = _bng_to_pixel(representative.x, representative.y, image_map)
+    px = float(np.clip(px, 0, image_map.width_px - 1)); py = float(np.clip(py, 0, image_map.height_px - 1))
+    rough_pixels = np.asarray([_bng_to_pixel(e, n, image_map) for e, n in rough.geometry_bng.exterior.coords[:-1]])
+    box_left, box_top = np.min(rough_pixels, axis=0)
+    box_right, box_bottom = np.max(rough_pixels, axis=0)
+    pad_px = cfg.refinement_box_padding_m / actual_mpp
+    box_prompt = np.array([
+        max(0.0, box_left-pad_px), max(0.0, box_top-pad_px),
+        min(image_map.width_px-1.0, box_right+pad_px), min(image_map.height_px-1.0, box_bottom+pad_px)
+    ], dtype=np.float32)
+    masks, scores, _ = predict_masks(
+        predictor, device_name,
+        np.array([[px, py]], dtype=np.float32), np.array([1], dtype=np.int32),
+        bounding_box=box_prompt, multiple_masks=True,
+    )
+    choices: list[tuple[float, Polygon]] = []
+    min_area = cfg.minimum_field_area_ha * SQUARE_METRES_PER_HECTARE
+    max_area = cfg.maximum_field_area_ha * SQUARE_METRES_PER_HECTARE
+    for mask, score in zip(masks, scores):
+        if not mask[int(round(py)), int(round(px))] or float(score) < cfg.refinement_minimum_sam_score:
+            continue
+        contour = _largest_mask_contour(mask)
+        if contour is None:
+            continue
+        polygon = _contour_to_bng_polygon(contour, image_map)
+        if polygon is None or not min_area <= polygon.area <= max_area:
+            continue
+        rough_overlap = polygon.intersection(rough.geometry_bng).area / max(rough.geometry_bng.area, 1.0)
+        if rough_overlap < cfg.refinement_minimum_rough_overlap_fraction:
+            continue
+        choices.append((float(score), polygon))
+    if not choices:
+        # Keep the rough geometry rather than losing a plausible field entirely.
+        refined_score, refined_polygon = rough.sam_score, rough.geometry_bng
+    else:
+        refined_score, refined_polygon = max(choices, key=lambda item: item[0])
+
+    refined_polygon = _simplify_for_editing(refined_polygon)
+    pixel_points = [list(_bng_to_pixel(e, n, image_map)) for e, n in refined_polygon.exterior.coords[:-1]]
+    return RefinedCandidate(rough.geometry_bng, refined_polygon, refined_score,
+                            image_map, pixel_points, float(refined_polygon.area))
+
+
+def _largest_mask_contour(mask: np.ndarray) -> np.ndarray | None:
+    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return max(contours, key=cv2.contourArea) if contours else None
+
+
+def _contour_to_bng_polygon(contour: np.ndarray, map_image: MapImage) -> Polygon | None:
+    points = contour[:, 0, :].astype(float)
+    if len(points) < 3:
+        return None
+    try:
+        return clean_polygon(Polygon([_pixel_to_bng(x, y, map_image) for x, y in points]))
+    except ValueError:
+        return None
+
+
+def _simplify_for_editing(field_polygon: Polygon) -> Polygon:
+    cfg = settings.field_discovery
+    tolerance = max(cfg.minimum_simplify_tolerance_m, cfg.simplify_tolerance_m)
+    best = field_polygon
+    for _ in range(cfg.simplify_maximum_iterations):
+        try:
+            simplified = clean_polygon(field_polygon.simplify(tolerance, preserve_topology=True))
+        except ValueError:
+            break
+        vertices = len(simplified.exterior.coords) - 1
+        if vertices < cfg.minimum_editor_vertices:
+            break
+        best = simplified
+        if vertices <= cfg.maximum_editor_vertices:
+            break
+        tolerance *= cfg.simplify_tolerance_growth
+    return best
+
+
+def _save_candidate_queue(candidates: list[RefinedCandidate], candidate_directory: Path,
+                          bng_to_wgs84: Transformer) -> None:
+    visual = settings.visualisation
+    for number, candidate in enumerate(candidates, start=1):
+        candidate_id = f"candidate_{number:03d}"
+        path = candidate_directory / candidate_id
+        path.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(candidate.refinement_image.image_path, path / "satellite.png")
+        write_boundary_points_compatible(path / "field_boundary.json", candidate.pixel_points)
+        write_boundary_points_compatible(path / "field_boundary_detected.json", candidate.pixel_points)
+        write_json(path / "discovery_boundary.json", {
+            "coordinate_system": "EPSG:4326",
+            "geometry": mapping(transform(bng_to_wgs84.transform, candidate.discovery_geometry_bng)),
+            "purpose": "rough whole-area SAM discovery boundary",
+        })
+        geometry_wgs84 = transform(bng_to_wgs84.transform, candidate.geometry_bng)
+        map_image = candidate.refinement_image
+        write_json(path / "candidate.json", {
+            "id": candidate_id, "status": "pending", "suggested_name": f"Field {number}",
+            "sam_score": candidate.sam_score,
+            "area_ha": candidate.area_m2 / SQUARE_METRES_PER_HECTARE,
+            "context": "refined from whole-area discovery",
+            "source_overview": "whole-area discovery",
+            "metres_per_pixel": map_image.metres_per_pixel,
+            "vertex_count": len(candidate.pixel_points),
+            "map": {"centre_lat": map_image.centre_latitude_deg, "centre_lon": map_image.centre_longitude_deg,
+                    "zoom": map_image.zoom, "width": map_image.width_px, "height": map_image.height_px},
+            "geometry_wgs84": mapping(geometry_wgs84),
+        })
+        review = cv2.imread(str(path / "satellite.png"))
+        if review is not None:
+            contour = np.rint(np.asarray(candidate.pixel_points)).astype(np.int32).reshape((-1, 1, 2))
+            cv2.polylines(review, [contour], True, visual.candidate_boundary_colour_bgr,
+                          visual.candidate_boundary_line_thickness_px, cv2.LINE_AA)
+            cv2.imwrite(str(path / "overlay.png"), review)
 
 
 def list_candidates(farm_id: str) -> list[dict[str, Any]]:
-    root = FARMS_DIR / farm_id / "field_candidates"
-    if not root.exists():
+    directory = FARMS_DIR / farm_id / "field_candidates"
+    if not directory.exists():
         return []
-
-    out = []
-    for d in sorted(p for p in root.iterdir() if p.is_dir()):
-        path = d / "candidate.json"
-        if path.exists():
-            data = json.loads(path.read_text(encoding="utf-8"))
-            data["id"] = d.name
-            out.append(data)
-    return out
+    result = []
+    for path in sorted(p for p in directory.iterdir() if p.is_dir()):
+        metadata = path / "candidate.json"
+        if metadata.exists():
+            result.append(read_json(metadata))
+    return result
 
 
-def set_candidate_status(farm_id: str, candidate_id: str, status: str) -> dict[str, Any]:
+def set_candidate_status(farm_id: str, candidate_id: str, status: str) -> None:
+    if status not in {"pending", "accepted", "rejected"}:
+        raise ValueError("Unknown candidate status.")
     path = FARMS_DIR / farm_id / "field_candidates" / candidate_id / "candidate.json"
-    data = json.loads(path.read_text(encoding="utf-8"))
-    data["status"] = status
-    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    return data
+    metadata = read_json(path); metadata["status"] = status; write_json(path, metadata)
 
 
 def approve_candidate(farm_id: str, candidate_id: str, field_name: str) -> dict[str, str]:
-    farm_dir = FARMS_DIR / farm_id
-    source = farm_dir / "field_candidates" / candidate_id
-    if not source.exists():
+    farm_directory = FARMS_DIR / farm_id
+    candidate_path = farm_directory / "field_candidates" / candidate_id
+    if not candidate_path.exists():
         raise FileNotFoundError(candidate_id)
-
-    field_name = field_name.strip() or candidate_id.replace("_", " ").title()
-    fields_dir = farm_dir / "fields"
-    fields_dir.mkdir(exist_ok=True)
-    target = _unique_dir(fields_dir, slugify(field_name))
-    target.mkdir()
-
-    for name in ("satellite.png", "field_boundary.json", "field_boundary_detected.json"):
-        shutil.copy2(source / name, target / name)
-
-    points = json.loads((source / "field_boundary.json").read_text(encoding="utf-8"))["points"]
-    write_boundary_points_compatible(target / "field_boundary_approved.json", points)
-
-    meta = json.loads((source / "candidate.json").read_text(encoding="utf-8"))
-    map_info = meta["map"]
-    (target / "metadata.json").write_text(
-        json.dumps({
-            "position": {
-                "latitude": map_info["centre_lat"],
-                "longitude": map_info["centre_lon"],
-            },
-            "zoom": map_info["zoom"],
-            "width": map_info["width"],
-            "height": map_info["height"],
-            "image_settings": {
-                "zoom": map_info["zoom"],
-                "width": map_info["width"],
-                "height": map_info["height"],
-            },
-            "metres_per_pixel": meta["metres_per_pixel"],
-            "source": "farm_field_discovery",
-        }, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-    (target / "field.json").write_text(
-        json.dumps({
-            "name": field_name,
-            "boundary_source": "cv_setup",
-            "boundary_locked": False,
-            "route_needs_regeneration": True,
-            "source_candidate": candidate_id,
-        }, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
+    cleaned_name = field_name.strip() or candidate_id.replace("_", " ").title()
+    fields_directory = farm_directory / "fields"; fields_directory.mkdir(exist_ok=True)
+    new_field_directory = unique_directory(fields_directory, slugify(cleaned_name)); new_field_directory.mkdir()
+    for filename in ("satellite.png", "field_boundary.json", "field_boundary_detected.json", "discovery_boundary.json"):
+        source = candidate_path / filename
+        if source.exists():
+            shutil.copy2(source, new_field_directory / filename)
+    current_boundary = read_json(candidate_path / "field_boundary.json")["points"]
+    write_boundary_points_compatible(new_field_directory / "field_boundary_approved.json", current_boundary, source="cv_setup")
+    candidate_metadata = read_json(candidate_path / "candidate.json")
+    map_information = candidate_metadata["map"]
+    write_json(new_field_directory / "metadata.json", {
+        "position": {"latitude": map_information["centre_lat"], "longitude": map_information["centre_lon"]},
+        "zoom": map_information["zoom"], "width": map_information["width"], "height": map_information["height"],
+        "image_settings": {"zoom": map_information["zoom"], "width": map_information["width"], "height": map_information["height"]},
+        "metres_per_pixel": candidate_metadata["metres_per_pixel"], "source": "farm_field_discovery",
+    })
+    write_json(new_field_directory / "field.json", {
+        "name": cleaned_name, "boundary_source": "cv_setup", "boundary_locked": False,
+        "route_needs_regeneration": True, "source_candidate": candidate_id,
+    })
     set_candidate_status(farm_id, candidate_id, "accepted")
-    return {"id": target.name, "name": field_name}
+    return {"id": new_field_directory.name, "name": cleaned_name}
 
 
-def _mpp(lat: float, zoom: float) -> float:
-    return EARTH_CIRCUMFERENCE_M * math.cos(math.radians(lat)) / (
-        MAPBOX_TILE_SIZE * 2**zoom
+def _intersection_over_union(first, second) -> float:
+    intersection = first.intersection(second).area
+    union = first.union(second).area
+    return float(intersection / union) if union else 0.0
+
+
+def _pixel_to_bng(pixel_x: float, pixel_y: float, map_image: MapImage) -> tuple[float, float]:
+    return (
+        float(map_image.centre_easting_m + (pixel_x - map_image.width_px / 2.0) * map_image.metres_per_pixel),
+        float(map_image.centre_northing_m - (pixel_y - map_image.height_px / 2.0) * map_image.metres_per_pixel),
     )
 
 
-def _zoom_for_mpp(lat: float, wanted: float) -> float:
-    return math.log2(
-        EARTH_CIRCUMFERENCE_M * math.cos(math.radians(lat))
-        / (MAPBOX_TILE_SIZE * wanted)
+def _bng_to_pixel(easting_m: float, northing_m: float, map_image: MapImage) -> tuple[float, float]:
+    return (
+        float((easting_m - map_image.centre_easting_m) / map_image.metres_per_pixel + map_image.width_px / 2.0),
+        float((map_image.centre_northing_m - northing_m) / map_image.metres_per_pixel + map_image.height_px / 2.0),
     )

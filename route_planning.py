@@ -1,17 +1,23 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
 import json
 import math
-import os
 
 from shapely import affinity
 from shapely.geometry import LineString, MultiLineString, Polygon
 
+from geometry_utils import clean_polygon
+from json_io import write_json
+from settings import PROJECT_ROOT, settings
 
-PROFILE_FILE = Path(__file__).with_name("tractor_profiles.json")
+
+TRACTOR_PROFILE_FILE = PROJECT_ROOT / "tractor_profiles.json"
+DIRECTION_PERIOD_DEG = 180.0
 
 
-@dataclass
+@dataclass(frozen=True)
 class RoutePlan:
     angle_deg: float
     working_polygon: Polygon
@@ -23,152 +29,243 @@ class RoutePlan:
     estimated_time_s: float
 
     @property
-    def total_distance_m(self):
-        return (self.working_distance_px + self.turn_distance_px) * self.metres_per_pixel
+    def total_distance_m(self) -> float:
+        total_distance_px = self.working_distance_px + self.turn_distance_px
+        return total_distance_px * self.metres_per_pixel
+
+
+@dataclass(frozen=True)
+class _RouteCandidate:
+    angle_deg: float
+    swaths: list[LineString]
+    working_distance_px: float
+    turn_distance_px: float
+    turns: int
+    estimated_time_s: float
 
 
 def plan_route(field: Polygon, metres_per_pixel: float) -> RoutePlan:
-    """Choose the lowest-cost parallel coverage direction."""
-    field_area_m2 = field.area * metres_per_pixel**2
-    min_x, min_y, max_x, max_y = field.bounds
-    field_width_m = (max_x - min_x) * metres_per_pixel
-    field_height_m = (max_y - min_y) * metres_per_pixel
+    """Choose the lowest estimated-time parallel coverage direction."""
+    route_settings = settings.route
+    _print_field_size(field, metres_per_pixel)
+
+    effective_pass_spacing_m = (
+        route_settings.implement_width_m
+        * (1.0 - route_settings.pass_overlap_fraction)
+    )
+    pass_spacing_px = effective_pass_spacing_m / metres_per_pixel
+    headland_width_px = route_settings.headland_width_m / metres_per_pixel
+
+    tractor = _load_tractor_profile(route_settings.tractor_profile)
+    turning_radius_px = tractor["turn_radius_m"] / metres_per_pixel
+
+    try:
+        working_polygon = clean_polygon(field.buffer(-headland_width_px))
+    except ValueError as exc:
+        raise RuntimeError("Headland is too wide for this field.") from exc
+
+    best_candidate: _RouteCandidate | None = None
+    candidate_angle_deg = 0.0
+
+    while candidate_angle_deg < DIRECTION_PERIOD_DEG:
+        candidate_swaths = _generate_swaths(
+            working_polygon,
+            angle_deg=candidate_angle_deg,
+            spacing_px=pass_spacing_px,
+        )
+        if candidate_swaths:
+            ordered_swaths = _order_swaths_boustrophedon(
+                candidate_swaths,
+                working_polygon,
+                candidate_angle_deg,
+            )
+            candidate = _evaluate_route_candidate(
+                angle_deg=candidate_angle_deg,
+                swaths=ordered_swaths,
+                metres_per_pixel=metres_per_pixel,
+                turning_radius_px=turning_radius_px,
+            )
+            if (
+                best_candidate is None
+                or candidate.estimated_time_s < best_candidate.estimated_time_s
+            ):
+                best_candidate = candidate
+
+        candidate_angle_deg += route_settings.straight_angle_step_deg
+
+    if best_candidate is None:
+        raise RuntimeError("No route could be generated.")
+
+    plan = RoutePlan(
+        angle_deg=best_candidate.angle_deg,
+        working_polygon=working_polygon,
+        swaths=best_candidate.swaths,
+        metres_per_pixel=metres_per_pixel,
+        working_distance_px=best_candidate.working_distance_px,
+        turn_distance_px=best_candidate.turn_distance_px,
+        turns=best_candidate.turns,
+        estimated_time_s=best_candidate.estimated_time_s,
+    )
     print(
-        f"Detected field: approximately "
+        f"Route: {len(plan.swaths)} passes, {plan.turns} turns, "
+        f"{plan.angle_deg:.1f}°, about {plan.estimated_time_s / 60.0:.1f} min"
+    )
+    return plan
+
+
+def _evaluate_route_candidate(
+    angle_deg: float,
+    swaths: list[LineString],
+    metres_per_pixel: float,
+    turning_radius_px: float,
+) -> _RouteCandidate:
+    route_settings = settings.route
+    working_distance_px = sum(swath.length for swath in swaths)
+    turn_distance_px = sum(
+        max(
+            math.dist(current.coords[-1], following.coords[0]),
+            math.pi * turning_radius_px,
+        )
+        for current, following in zip(swaths, swaths[1:])
+    )
+    turn_count = max(0, len(swaths) - 1)
+
+    estimated_time_s = (
+        working_distance_px
+        * metres_per_pixel
+        / route_settings.working_speed_mps
+        + turn_distance_px
+        * metres_per_pixel
+        / route_settings.turning_speed_mps
+        + turn_count * route_settings.fixed_turn_time_s
+    )
+    return _RouteCandidate(
+        angle_deg=angle_deg,
+        swaths=swaths,
+        working_distance_px=working_distance_px,
+        turn_distance_px=turn_distance_px,
+        turns=turn_count,
+        estimated_time_s=estimated_time_s,
+    )
+
+
+def save_route_plan(plan: RoutePlan, path: Path) -> None:
+    write_json(
+        path,
+        {
+            "angle_deg": plan.angle_deg,
+            "passes": len(plan.swaths),
+            "turns": plan.turns,
+            "working_distance_m": plan.working_distance_px * plan.metres_per_pixel,
+            "turn_distance_m": plan.turn_distance_px * plan.metres_per_pixel,
+            "total_distance_m": plan.total_distance_m,
+            "estimated_time_min": plan.estimated_time_s / 60.0,
+            "swaths_pixels": [
+                [[float(x), float(y)] for x, y in swath.coords]
+                for swath in plan.swaths
+            ],
+        },
+    )
+
+
+def _load_tractor_profile(profile_name: str) -> dict[str, float | bool]:
+    profiles = json.loads(TRACTOR_PROFILE_FILE.read_text(encoding="utf-8"))
+    if profile_name not in profiles:
+        raise KeyError(f"Unknown tractor profile: {profile_name}")
+
+    profile = profiles[profile_name]
+    turning_radius_m = profile.get("minimum_turning_radius_m")
+    should_calculate_radius = (
+        not profile.get("use_measured_turning_radius", True)
+        or turning_radius_m is None
+    )
+    if should_calculate_radius:
+        turning_radius_m = profile["wheelbase_m"] / math.tan(
+            math.radians(profile["max_steering_angle_deg"])
+        )
+
+    return {
+        "turn_radius_m": float(turning_radius_m),
+        "can_reverse": bool(profile["can_reverse"]),
+    }
+
+
+def _generate_swaths(
+    working_polygon: Polygon,
+    angle_deg: float,
+    spacing_px: float,
+) -> list[LineString]:
+    field_centre = working_polygon.centroid
+    rotated_polygon = affinity.rotate(
+        working_polygon,
+        -angle_deg,
+        origin=field_centre,
+    )
+    minimum_x, minimum_y, maximum_x, maximum_y = rotated_polygon.bounds
+    cutting_line_extension_px = max(
+        maximum_x - minimum_x,
+        maximum_y - minimum_y,
+    )
+
+    rotated_swaths: list[LineString] = []
+    swath_y = minimum_y + spacing_px / 2.0
+    while swath_y <= maximum_y:
+        cutting_line = LineString(
+            [
+                (minimum_x - cutting_line_extension_px, swath_y),
+                (maximum_x + cutting_line_extension_px, swath_y),
+            ]
+        )
+        clipped_geometry = rotated_polygon.intersection(cutting_line)
+        if isinstance(clipped_geometry, LineString):
+            line_parts = [clipped_geometry]
+        elif isinstance(clipped_geometry, MultiLineString):
+            line_parts = list(clipped_geometry.geoms)
+        else:
+            line_parts = []
+
+        rotated_swaths.extend(
+            line_part for line_part in line_parts if line_part.length > 0.0
+        )
+        swath_y += spacing_px
+
+    return [
+        affinity.rotate(swath, angle_deg, origin=field_centre)
+        for swath in rotated_swaths
+    ]
+
+
+def _order_swaths_boustrophedon(
+    swaths: list[LineString],
+    working_polygon: Polygon,
+    angle_deg: float,
+) -> list[LineString]:
+    field_centre = working_polygon.centroid
+    spatially_ordered_swaths = sorted(
+        swaths,
+        key=lambda swath: affinity.rotate(
+            swath,
+            -angle_deg,
+            origin=field_centre,
+        ).centroid.y,
+    )
+
+    ordered_swaths: list[LineString] = []
+    for swath_index, swath in enumerate(spatially_ordered_swaths):
+        coordinates = list(swath.coords)
+        if swath_index % 2 == 1:
+            coordinates.reverse()
+        ordered_swaths.append(LineString(coordinates))
+    return ordered_swaths
+
+
+def _print_field_size(field: Polygon, metres_per_pixel: float) -> None:
+    field_area_m2 = field.area * metres_per_pixel**2
+    minimum_x, minimum_y, maximum_x, maximum_y = field.bounds
+    field_width_m = (maximum_x - minimum_x) * metres_per_pixel
+    field_height_m = (maximum_y - minimum_y) * metres_per_pixel
+    print(
+        "Detected field: approximately "
         f"{field_width_m:.1f} m × {field_height_m:.1f} m, "
         f"{field_area_m2:.0f} m²"
     )
-    implement_m = float(os.getenv("IMPLEMENT_WIDTH_M", "6"))
-    headland_m = float(os.getenv("HEADLAND_WIDTH_M", "10"))
-    overlap = float(os.getenv("OVERLAP", "0.02"))
-    angle_step = float(os.getenv("ANGLE_STEP_DEG", "2"))
-    work_speed = float(os.getenv("WORKING_SPEED_MPS", "2.5"))
-    turn_speed = float(os.getenv("TURNING_SPEED_MPS", "1.5"))
-    fixed_turn_s = float(os.getenv("FIXED_TURN_TIME_S", "2"))
-
-    tractor = _tractor(os.getenv("TRACTOR_PROFILE", "default_tractor"))
-    px_per_m = 1 / metres_per_pixel
-
-    implement = implement_m * px_per_m * (1 - overlap)
-    headland = headland_m * px_per_m
-    turn_radius = tractor["turn_radius_m"] * px_per_m
-
-    working = field.buffer(-headland)
-    if working.is_empty:
-        raise RuntimeError("Headland is too wide for this field.")
-    if not isinstance(working, Polygon):
-        working = max(working.geoms, key=lambda p: p.area)
-
-    best = None
-
-    angle = 0.0
-    while angle < 180:
-        swaths = _swaths(working, angle, implement)
-        if swaths:
-            swaths = _order(swaths, working, angle)
-            work_px = sum(line.length for line in swaths)
-            turn_px = sum(
-                max(
-                    math.dist(swaths[i].coords[-1], swaths[i + 1].coords[0]),
-                    math.pi * turn_radius,
-                )
-                for i in range(len(swaths) - 1)
-            )
-            turns = max(0, len(swaths) - 1)
-
-            time_s = (
-                work_px * metres_per_pixel / work_speed
-                + turn_px * metres_per_pixel / turn_speed
-                + turns * fixed_turn_s
-            )
-
-            if best is None or time_s < best.estimated_time_s:
-                best = RoutePlan(
-                    angle, working, swaths, metres_per_pixel,
-                    work_px, turn_px, turns, time_s
-                )
-
-        angle += angle_step
-
-    if best is None:
-        raise RuntimeError("No route could be generated.")
-
-    print(
-        f"Route: {len(best.swaths)} passes, {best.turns} turns, "
-        f"{best.angle_deg:.1f}°, about {best.estimated_time_s / 60:.1f} min"
-    )
-    return best
-
-
-def save_route_plan(plan: RoutePlan, path: Path):
-    path.write_text(
-        json.dumps(
-            {
-                "angle_deg": plan.angle_deg,
-                "passes": len(plan.swaths),
-                "turns": plan.turns,
-                "working_distance_m": plan.working_distance_px * plan.metres_per_pixel,
-                "turn_distance_m": plan.turn_distance_px * plan.metres_per_pixel,
-                "total_distance_m": plan.total_distance_m,
-                "estimated_time_min": plan.estimated_time_s / 60,
-                "swaths_pixels": [
-                    [[float(x), float(y)] for x, y in line.coords]
-                    for line in plan.swaths
-                ],
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-
-def _tractor(name):
-    profiles = json.loads(PROFILE_FILE.read_text(encoding="utf-8"))
-    data = profiles[name]
-
-    radius = data.get("minimum_turning_radius_m")
-    if not data.get("use_measured_turning_radius", True) or radius is None:
-        radius = data["wheelbase_m"] / math.tan(
-            math.radians(data["max_steering_angle_deg"])
-        )
-
-    return {"turn_radius_m": float(radius), "can_reverse": bool(data["can_reverse"])}
-
-
-def _swaths(field: Polygon, angle: float, spacing: float):
-    centre = field.centroid
-    rotated = affinity.rotate(field, -angle, origin=centre)
-    min_x, min_y, max_x, max_y = rotated.bounds
-    extra = max(max_x - min_x, max_y - min_y)
-
-    lines = []
-    y = min_y + spacing / 2
-
-    while y <= max_y:
-        cut = rotated.intersection(
-            LineString([(min_x - extra, y), (max_x + extra, y)])
-        )
-        parts = [cut] if isinstance(cut, LineString) else (
-            list(cut.geoms) if isinstance(cut, MultiLineString) else []
-        )
-        lines.extend(line for line in parts if line.length > 0)
-        y += spacing
-
-    return [affinity.rotate(line, angle, origin=centre) for line in lines]
-
-
-def _order(swaths, field, angle):
-    centre = field.centroid
-    ordered = sorted(
-        swaths,
-        key=lambda line: affinity.rotate(line, -angle, origin=centre).centroid.y,
-    )
-
-    result = []
-    for i, line in enumerate(ordered):
-        coords = list(line.coords)
-        if i % 2:
-            coords.reverse()
-        result.append(LineString(coords))
-    return result

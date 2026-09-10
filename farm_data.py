@@ -1,15 +1,44 @@
+"""Local farm, field and boundary storage helpers."""
+
 from __future__ import annotations
 
-import json
 import re
 import shutil
 from pathlib import Path
 from typing import Any
 
+from json_io import read_json, write_json
+from settings import PROJECT_ROOT
 
-ROOT = Path(__file__).resolve().parent
-FARMS_DIR = ROOT / "farms"
-CAPTURES_DIR = ROOT / "captures"
+
+FARMS_DIR = PROJECT_ROOT / "farms"
+CAPTURES_DIR = PROJECT_ROOT / "captures"
+
+COORDINATE_EQUALITY_TOLERANCE = 1e-9
+DUPLICATE_SUFFIX_START = 2
+
+CAPTURE_FILES_TO_COPY = (
+    "satellite.png",
+    "metadata.json",
+    "field_boundary.png",
+    "field_boundary.json",
+    "terrain_data.npz",
+    "terrain.json",
+    "terrain_overlay.png",
+    "route_plan.json",
+    "route_overlay.png",
+    "mask.png",
+)
+
+BOUNDARY_POINT_KEYS = (
+    "points",
+    "pixel_points",
+    "polygon_pixels",
+    "boundary_pixels",
+    "contour_points",
+    "vertices",
+    "coordinates",
+)
 
 
 def ensure_storage() -> None:
@@ -18,92 +47,94 @@ def ensure_storage() -> None:
 
 
 def slugify(text: str) -> str:
-    value = re.sub(r"[^a-zA-Z0-9_-]+", "_", text.strip()).strip("_").lower()
-    return value or "field"
+    cleaned_text = re.sub(r"[^a-zA-Z0-9_-]+", "_", text.strip())
+    cleaned_text = cleaned_text.strip("_").lower()
+    return cleaned_text or "field"
 
 
-def _unique_dir(parent: Path, slug: str) -> Path:
-    candidate = parent / slug
-    if not candidate.exists():
-        return candidate
+def unique_directory(parent: Path, base_name: str) -> Path:
+    """Return an unused child directory path without creating it."""
+    candidate_path = parent / base_name
+    if not candidate_path.exists():
+        return candidate_path
 
-    i = 2
-    while (parent / f"{slug}_{i}").exists():
-        i += 1
-    return parent / f"{slug}_{i}"
+    suffix_number = DUPLICATE_SUFFIX_START
+    while (parent / f"{base_name}_{suffix_number}").exists():
+        suffix_number += 1
+    return parent / f"{base_name}_{suffix_number}"
 
 
 def list_farms() -> list[dict[str, Any]]:
     ensure_storage()
-    farms = []
+    farms: list[dict[str, Any]] = []
 
-    for farm_dir in sorted(p for p in FARMS_DIR.iterdir() if p.is_dir()):
-        metadata_path = farm_dir / "farm.json"
-        if metadata_path.exists():
-            data = json.loads(metadata_path.read_text(encoding="utf-8"))
-        else:
-            data = {"name": farm_dir.name}
+    for farm_directory in sorted(path for path in FARMS_DIR.iterdir() if path.is_dir()):
+        metadata_path = farm_directory / "farm.json"
+        metadata = (
+            read_json(metadata_path)
+            if metadata_path.exists()
+            else {"name": farm_directory.name}
+        )
 
-        fields_dir = farm_dir / "fields"
-        field_count = 0
-        if fields_dir.exists():
-            field_count = len([p for p in fields_dir.iterdir() if p.is_dir()])
+        fields_directory = farm_directory / "fields"
+        field_count = (
+            sum(1 for path in fields_directory.iterdir() if path.is_dir())
+            if fields_directory.exists()
+            else 0
+        )
 
-        farms.append({
-            "id": farm_dir.name,
-            "name": data.get("name", farm_dir.name),
-            "field_count": field_count,
-            "setup_complete": bool(data.get("setup_complete", False)),
-        })
+        farms.append(
+            {
+                "id": farm_directory.name,
+                "name": metadata.get("name", farm_directory.name),
+                "field_count": field_count,
+                "setup_complete": bool(metadata.get("setup_complete", False)),
+            }
+        )
 
     return farms
 
 
 def create_farm(name: str) -> dict[str, str]:
     ensure_storage()
-
-    name = name.strip()
-    if not name:
+    cleaned_name = name.strip()
+    if not cleaned_name:
         raise ValueError("Farm name cannot be empty.")
 
-    farm_dir = _unique_dir(FARMS_DIR, slugify(name))
-    (farm_dir / "fields").mkdir(parents=True)
-
-    (farm_dir / "farm.json").write_text(
-        json.dumps({"name": name}, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-    return {"id": farm_dir.name, "name": name}
+    farm_directory = unique_directory(FARMS_DIR, slugify(cleaned_name))
+    (farm_directory / "fields").mkdir(parents=True)
+    write_json(farm_directory / "farm.json", {"name": cleaned_name})
+    return {"id": farm_directory.name, "name": cleaned_name}
 
 
 def get_farm(farm_id: str) -> dict[str, Any]:
-    farm_dir = FARMS_DIR / farm_id
-    if not farm_dir.exists():
+    farm_directory = FARMS_DIR / farm_id
+    if not farm_directory.exists():
         raise FileNotFoundError(farm_id)
 
-    metadata_path = farm_dir / "farm.json"
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata = read_json(farm_directory / "farm.json")
+    fields_directory = farm_directory / "fields"
+    fields_directory.mkdir(exist_ok=True)
 
-    fields = []
-    fields_dir = farm_dir / "fields"
-    fields_dir.mkdir(exist_ok=True)
-
-    for field_dir_path in sorted(p for p in fields_dir.iterdir() if p.is_dir()):
-        field_json = field_dir_path / "field.json"
-
-        if field_json.exists():
-            data = json.loads(field_json.read_text(encoding="utf-8"))
-        else:
-            data = {"name": field_dir_path.name}
-
-        fields.append({
-            "id": field_dir_path.name,
-            "name": data.get("name", field_dir_path.name),
-            "route_ready": (field_dir_path / "route_plan.json").exists(),
-            "has_terrain": (field_dir_path / "terrain_data.npz").exists(),
-            "boundary_source": data.get("boundary_source", "unknown"),
-        })
+    fields: list[dict[str, Any]] = []
+    for field_directory in sorted(
+        path for path in fields_directory.iterdir() if path.is_dir()
+    ):
+        field_metadata_path = field_directory / "field.json"
+        field_metadata = (
+            read_json(field_metadata_path)
+            if field_metadata_path.exists()
+            else {"name": field_directory.name}
+        )
+        fields.append(
+            {
+                "id": field_directory.name,
+                "name": field_metadata.get("name", field_directory.name),
+                "route_ready": (field_directory / "route_plan.json").exists(),
+                "has_terrain": (field_directory / "terrain_data.npz").exists(),
+                "boundary_source": field_metadata.get("boundary_source", "unknown"),
+            }
+        )
 
     return {
         "id": farm_id,
@@ -118,19 +149,21 @@ def get_farm(farm_id: str) -> dict[str, Any]:
 
 def list_capture_candidates() -> list[dict[str, str]]:
     ensure_storage()
-    result = []
+    available_captures: list[dict[str, str]] = []
 
-    for capture in sorted(
-        (p for p in CAPTURES_DIR.iterdir() if p.is_dir()),
+    capture_directories = sorted(
+        (path for path in CAPTURES_DIR.iterdir() if path.is_dir()),
         reverse=True,
-    ):
-        satellite = capture / "satellite.png"
-        boundary = capture / "field_boundary.json"
+    )
+    for capture_directory in capture_directories:
+        has_satellite_image = (capture_directory / "satellite.png").exists()
+        has_boundary = (capture_directory / "field_boundary.json").exists()
+        if has_satellite_image and has_boundary:
+            available_captures.append(
+                {"id": capture_directory.name, "label": capture_directory.name}
+            )
 
-        if satellite.exists() and boundary.exists():
-            result.append({"id": capture.name, "label": capture.name})
-
-    return result
+    return available_captures
 
 
 def import_capture_as_field(
@@ -138,154 +171,131 @@ def import_capture_as_field(
     capture_id: str,
     field_name: str,
 ) -> dict[str, str]:
-    farm_dir = FARMS_DIR / farm_id
-    capture_dir = CAPTURES_DIR / capture_id
+    farm_directory = FARMS_DIR / farm_id
+    capture_directory = CAPTURES_DIR / capture_id
 
-    if not farm_dir.exists():
+    if not farm_directory.exists():
         raise FileNotFoundError(f"Farm not found: {farm_id}")
-
-    if not capture_dir.exists():
+    if not capture_directory.exists():
         raise FileNotFoundError(f"Capture not found: {capture_id}")
-
-    if not (capture_dir / "satellite.png").exists():
+    if not (capture_directory / "satellite.png").exists():
         raise FileNotFoundError("Capture does not contain satellite.png")
-
-    if not (capture_dir / "field_boundary.json").exists():
+    if not (capture_directory / "field_boundary.json").exists():
         raise FileNotFoundError("Capture does not contain field_boundary.json")
 
-    field_name = field_name.strip()
-    if not field_name:
+    cleaned_field_name = field_name.strip()
+    if not cleaned_field_name:
         raise ValueError("Field name cannot be empty.")
 
-    fields_dir = farm_dir / "fields"
-    fields_dir.mkdir(exist_ok=True)
+    fields_directory = farm_directory / "fields"
+    fields_directory.mkdir(exist_ok=True)
+    new_field_directory = unique_directory(
+        fields_directory,
+        slugify(cleaned_field_name),
+    )
+    new_field_directory.mkdir()
 
-    field_dir_path = _unique_dir(fields_dir, slugify(field_name))
-    field_dir_path.mkdir()
+    for filename in CAPTURE_FILES_TO_COPY:
+        source_path = capture_directory / filename
+        if source_path.exists():
+            shutil.copy2(source_path, new_field_directory / filename)
 
-    copy_names = [
-        "satellite.png",
-        "metadata.json",
-        "field_boundary.png",
-        "field_boundary.json",
-        "terrain_data.npz",
-        "terrain.json",
-        "terrain_overlay.png",
-        "route_plan.json",
-        "route_overlay.png",
-        "mask.png",
-    ]
-
-    for name in copy_names:
-        source = capture_dir / name
-        if source.exists():
-            shutil.copy2(source, field_dir_path / name)
-
+    detected_boundary_path = new_field_directory / "field_boundary_detected.json"
     shutil.copy2(
-        capture_dir / "field_boundary.json",
-        field_dir_path / "field_boundary_detected.json",
+        capture_directory / "field_boundary.json",
+        detected_boundary_path,
+    )
+    detected_points = read_boundary_points(detected_boundary_path)
+    write_boundary_points_compatible(
+        new_field_directory / "field_boundary_approved.json",
+        detected_points,
+        source="cv",
     )
 
-    detected_points = read_boundary_points(
-        field_dir_path / "field_boundary_detected.json"
+    write_json(
+        new_field_directory / "field.json",
+        {
+            "name": cleaned_field_name,
+            "source_capture": capture_id,
+            "boundary_source": "cv",
+            "boundary_locked": False,
+            "route_needs_regeneration": False,
+        },
     )
 
-    (field_dir_path / "field_boundary_approved.json").write_text(
-        json.dumps(
-            {"source": "cv", "points": detected_points},
-            indent=2,
-        ) + "\n",
-        encoding="utf-8",
-    )
-
-    (field_dir_path / "field.json").write_text(
-        json.dumps(
-            {
-                "name": field_name,
-                "source_capture": capture_id,
-                "boundary_source": "cv",
-                "boundary_locked": False,
-                "route_needs_regeneration": False,
-            },
-            indent=2,
-        ) + "\n",
-        encoding="utf-8",
-    )
-
-    return {"id": field_dir_path.name, "name": field_name}
+    return {"id": new_field_directory.name, "name": cleaned_field_name}
 
 
 def field_dir(farm_id: str, field_id: str) -> Path:
-    path = FARMS_DIR / farm_id / "fields" / field_id
-    if not path.exists():
+    field_directory = FARMS_DIR / farm_id / "fields" / field_id
+    if not field_directory.exists():
         raise FileNotFoundError(field_id)
-    return path
+    return field_directory
 
 
 def get_field(farm_id: str, field_id: str) -> dict[str, Any]:
-    path = field_dir(farm_id, field_id)
-
-    field_json = path / "field.json"
-    if field_json.exists():
-        data = json.loads(field_json.read_text(encoding="utf-8"))
-    else:
-        data = {
+    field_directory = field_dir(farm_id, field_id)
+    metadata_path = field_directory / "field.json"
+    field_metadata = (
+        read_json(metadata_path)
+        if metadata_path.exists()
+        else {
             "name": field_id,
             "boundary_source": "cv",
             "boundary_locked": False,
         }
+    )
 
-    detected_path = path / "field_boundary_detected.json"
-    current_path = path / "field_boundary.json"
-    approved_path = path / "field_boundary_approved.json"
+    detected_boundary_path = field_directory / "field_boundary_detected.json"
+    current_boundary_path = field_directory / "field_boundary.json"
+    approved_boundary_path = field_directory / "field_boundary_approved.json"
 
-    # Recover older fields automatically.
-    # If field_boundary_detected.json wasn't created by the first UI version,
-    # preserve the current boundary as the detected baseline.
-    if not detected_path.exists():
-        if not current_path.exists():
-            raise FileNotFoundError(
-                f"No field boundary found for {field_id}."
-            )
-        shutil.copy2(current_path, detected_path)
+    # Older fields may predate the detected/approved split. Preserve the current
+    # boundary as the immutable detected baseline when upgrading them.
+    if not detected_boundary_path.exists():
+        if not current_boundary_path.exists():
+            raise FileNotFoundError(f"No field boundary found for {field_id}.")
+        shutil.copy2(current_boundary_path, detected_boundary_path)
 
-    detected = read_boundary_points(detected_path)
+    detected_points = read_boundary_points(detected_boundary_path)
+    approved_points = _load_best_approved_points(
+        approved_boundary_path=approved_boundary_path,
+        current_boundary_path=current_boundary_path,
+        detected_points=detected_points,
+    )
 
-    # If the approved file is missing or was created in a format the UI cannot
-    # read, rebuild it from the current/detected boundary rather than crashing.
-    try:
-        if approved_path.exists():
-            approved_data = json.loads(approved_path.read_text(encoding="utf-8"))
-            points = _extract_points(approved_data)
-        elif current_path.exists():
-            points = read_boundary_points(current_path)
-        else:
-            points = detected
-    except (ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError):
-        points = detected
-
-    if not approved_path.exists():
-        approved_path.write_text(
-            json.dumps(
-                {
-                    "source": data.get("boundary_source", "cv"),
-                    "points": points,
-                },
-                indent=2,
-            ) + "\n",
-            encoding="utf-8",
+    if not approved_boundary_path.exists():
+        write_boundary_points_compatible(
+            approved_boundary_path,
+            approved_points,
+            source=field_metadata.get("boundary_source", "cv"),
         )
 
     return {
         "id": field_id,
-        "name": data.get("name", field_id),
-        "boundary_source": data.get("boundary_source", "cv"),
-        "boundary_locked": bool(data.get("boundary_locked", False)),
-        "points": points,
-        "detected_points": detected,
-        "route_ready": (path / "route_plan.json").exists(),
-        "source_candidate": data.get("source_candidate"),
+        "name": field_metadata.get("name", field_id),
+        "boundary_source": field_metadata.get("boundary_source", "cv"),
+        "boundary_locked": bool(field_metadata.get("boundary_locked", False)),
+        "points": approved_points,
+        "detected_points": detected_points,
+        "route_ready": (field_directory / "route_plan.json").exists(),
+        "source_candidate": field_metadata.get("source_candidate"),
     }
+
+
+def _load_best_approved_points(
+    approved_boundary_path: Path,
+    current_boundary_path: Path,
+    detected_points: list[list[float]],
+) -> list[list[float]]:
+    try:
+        if approved_boundary_path.exists():
+            return _extract_points(read_json(approved_boundary_path))
+        if current_boundary_path.exists():
+            return read_boundary_points(current_boundary_path)
+    except (ValueError, TypeError, KeyError, IndexError):
+        pass
+    return detected_points
 
 
 def save_boundary(
@@ -294,168 +304,126 @@ def save_boundary(
     points: list[list[float]],
     source: str = "manual_edit",
 ) -> None:
-    if len(points) < 3:
-        raise ValueError("A field boundary needs at least three points.")
+    cleaned_points = _strip_closed_coordinate(points)
+    field_directory = field_dir(farm_id, field_id)
 
-    clean_points = _strip_closed_coordinate(points)
-    path = field_dir(farm_id, field_id)
-
-    (path / "field_boundary_approved.json").write_text(
-        json.dumps(
-            {
-                "source": source,
-                "points": clean_points,
-            },
-            indent=2,
-        ) + "\n",
-        encoding="utf-8",
-    )
-
-    # This remains easy for the UI to read.
     write_boundary_points_compatible(
-        path / "field_boundary.json",
-        clean_points,
+        field_directory / "field_boundary_approved.json",
+        cleaned_points,
+        source=source,
+    )
+    write_boundary_points_compatible(
+        field_directory / "field_boundary.json",
+        cleaned_points,
+        source=source,
     )
 
-    field_json = path / "field.json"
-    if field_json.exists():
-        data = json.loads(field_json.read_text(encoding="utf-8"))
-    else:
-        data = {"name": field_id}
-
-    data["boundary_source"] = source
-    data["boundary_locked"] = True
-    data["route_needs_regeneration"] = True
-
-    field_json.write_text(
-        json.dumps(data, indent=2) + "\n",
-        encoding="utf-8",
+    metadata_path = field_directory / "field.json"
+    field_metadata = (
+        read_json(metadata_path)
+        if metadata_path.exists()
+        else {"name": field_id}
     )
+    field_metadata.update(
+        {
+            "boundary_source": source,
+            "boundary_locked": True,
+            "route_needs_regeneration": True,
+        }
+    )
+    write_json(metadata_path, field_metadata)
 
 
 def reset_boundary(farm_id: str, field_id: str) -> list[list[float]]:
-    path = field_dir(farm_id, field_id)
-    points = read_boundary_points(path / "field_boundary_detected.json")
-
-    (path / "field_boundary_approved.json").write_text(
-        json.dumps({"source": "cv", "points": points}, indent=2) + "\n",
-        encoding="utf-8",
+    field_directory = field_dir(farm_id, field_id)
+    detected_points = read_boundary_points(
+        field_directory / "field_boundary_detected.json"
     )
 
-    write_boundary_points_compatible(
-        path / "field_boundary.json",
-        points,
+    for filename in ("field_boundary_approved.json", "field_boundary.json"):
+        write_boundary_points_compatible(
+            field_directory / filename,
+            detected_points,
+            source="cv",
+        )
+
+    metadata_path = field_directory / "field.json"
+    field_metadata = (
+        read_json(metadata_path)
+        if metadata_path.exists()
+        else {"name": field_id}
     )
-
-    field_json = path / "field.json"
-    if field_json.exists():
-        data = json.loads(field_json.read_text(encoding="utf-8"))
-    else:
-        data = {"name": field_id}
-
-    data["boundary_source"] = "cv"
-    data["boundary_locked"] = False
-    data["route_needs_regeneration"] = True
-
-    field_json.write_text(
-        json.dumps(data, indent=2) + "\n",
-        encoding="utf-8",
+    field_metadata.update(
+        {
+            "boundary_source": "cv",
+            "boundary_locked": False,
+            "route_needs_regeneration": True,
+        }
     )
-
-    return points
+    write_json(metadata_path, field_metadata)
+    return detected_points
 
 
 def read_boundary_points(path: Path) -> list[list[float]]:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return _extract_points(data)
+    return _extract_points(read_json(path))
 
 
 def _extract_points(data: Any) -> list[list[float]]:
-    """
-    Accept all boundary JSON formats used by the GPS Tractor project so far.
-
-    Supported examples:
-      {"points": [[x,y], ...]}
-      {"polygon_pixels": [[x,y], ...]}
-      {"boundary_pixels": [[x,y], ...]}
-      {"coordinates": [[x,y], ...]}
-      {"polygon": [[x,y], ...]}
-      {"polygon": {"coordinates": [[[x,y], ...]]}}
-      {"geometry": {"type":"Polygon", "coordinates":[[[x,y], ...]]}}
-      GeoJSON Feature / FeatureCollection
-      raw [[x,y], ...]
-    """
+    """Read every boundary JSON format used by earlier GPS Tractor versions."""
     if isinstance(data, list):
         return _normalise_coordinate_container(data)
-
     if not isinstance(data, dict):
         raise ValueError("Boundary JSON is neither an object nor a list.")
 
-    # Current UI format.
-    for key in (
-        "points",
-        "pixel_points",
-        "polygon_pixels",
-        "boundary_pixels",
-        "contour_points",
-        "vertices",
-        "coordinates",
-    ):
-        if key in data:
-            return _normalise_coordinate_container(data[key])
+    for point_key in BOUNDARY_POINT_KEYS:
+        if point_key in data:
+            return _normalise_coordinate_container(data[point_key])
 
     if "polygon" in data:
-        polygon = data["polygon"]
-        if isinstance(polygon, dict):
-            if "coordinates" in polygon:
-                return _normalise_coordinate_container(polygon["coordinates"])
-            if "points" in polygon:
-                return _normalise_coordinate_container(polygon["points"])
-        return _normalise_coordinate_container(polygon)
+        polygon_value = data["polygon"]
+        if isinstance(polygon_value, dict):
+            for point_key in ("coordinates", "points"):
+                if point_key in polygon_value:
+                    return _normalise_coordinate_container(polygon_value[point_key])
+        return _normalise_coordinate_container(polygon_value)
 
-    # GeoJSON geometry.
-    if "geometry" in data and isinstance(data["geometry"], dict):
-        geometry = data["geometry"]
-        if geometry.get("type") == "Polygon" and "coordinates" in geometry:
-            return _normalise_coordinate_container(geometry["coordinates"])
-        if geometry.get("type") == "MultiPolygon" and "coordinates" in geometry:
-            polygons = geometry["coordinates"]
-            if not polygons:
-                raise ValueError("Empty MultiPolygon.")
-            # Use the largest ring by point count as a safe UI fallback.
-            rings = []
-            for poly in polygons:
-                if poly:
-                    rings.extend(poly[:1])
-            if not rings:
-                raise ValueError("Empty MultiPolygon.")
-            return _normalise_coordinate_container(max(rings, key=len))
+    geometry = data.get("geometry")
+    if isinstance(geometry, dict):
+        geometry_type = geometry.get("type")
+        coordinates = geometry.get("coordinates")
+        if geometry_type == "Polygon" and coordinates is not None:
+            return _normalise_coordinate_container(coordinates)
+        if geometry_type == "MultiPolygon" and coordinates:
+            exterior_rings = [
+                polygon[0]
+                for polygon in coordinates
+                if polygon and polygon[0]
+            ]
+            if exterior_rings:
+                return _normalise_coordinate_container(
+                    max(exterior_rings, key=len)
+                )
+            raise ValueError("Empty MultiPolygon.")
 
-    # GeoJSON Feature.
-    if data.get("type") == "Feature" and "geometry" in data:
-        return _extract_points({"geometry": data["geometry"]})
-
-    # GeoJSON FeatureCollection.
     if data.get("type") == "FeatureCollection":
-        features = data.get("features", [])
-        if not features:
-            raise ValueError("Empty FeatureCollection.")
-        candidates = []
-        for feature in features:
+        candidate_boundaries: list[list[list[float]]] = []
+        for feature in data.get("features", []):
             try:
-                candidates.append(_extract_points(feature))
+                candidate_boundaries.append(_extract_points(feature))
             except ValueError:
-                pass
-        if candidates:
-            return max(candidates, key=len)
+                continue
+        if candidate_boundaries:
+            return max(candidate_boundaries, key=len)
+        raise ValueError("Empty FeatureCollection.")
 
-    # Last-resort recursive search through likely nested dicts.
-    for key, value in data.items():
-        if isinstance(value, dict):
-            try:
-                return _extract_points(value)
-            except ValueError:
-                pass
+    # Last-resort recursive search handles older nested wrapper objects.
+    for nested_value in data.values():
+        if not isinstance(nested_value, dict):
+            continue
+        try:
+            return _extract_points(nested_value)
+        except ValueError:
+            continue
 
     raise ValueError(
         "Could not find polygon coordinates in field boundary JSON. "
@@ -463,63 +431,65 @@ def _extract_points(data: Any) -> list[list[float]]:
     )
 
 
-def _normalise_coordinate_container(coords: Any) -> list[list[float]]:
-    """
-    Peel nested Polygon coordinate containers until we reach [[x,y], ...].
-    """
-    value = coords
-
+def _normalise_coordinate_container(coordinates: Any) -> list[list[float]]:
+    """Peel Polygon/MultiPolygon wrappers until [[x, y], ...] remains."""
+    coordinate_container = coordinates
     while (
-        isinstance(value, list)
-        and value
-        and isinstance(value[0], list)
-        and value[0]
-        and isinstance(value[0][0], list)
+        isinstance(coordinate_container, list)
+        and coordinate_container
+        and isinstance(coordinate_container[0], list)
+        and coordinate_container[0]
+        and isinstance(coordinate_container[0][0], list)
     ):
-        # Polygon -> first exterior ring.
-        # MultiPolygon -> keep drilling into first polygon/ring.
-        value = value[0]
+        coordinate_container = coordinate_container[0]
 
-    if not isinstance(value, list) or len(value) < 3:
+    if not isinstance(coordinate_container, list) or len(coordinate_container) < 3:
         raise ValueError("Boundary has fewer than three coordinate points.")
 
-    points = []
-
-    for p in value:
-        if not isinstance(p, (list, tuple)) or len(p) < 2:
+    points: list[list[float]] = []
+    for coordinate_pair in coordinate_container:
+        if not isinstance(coordinate_pair, (list, tuple)) or len(coordinate_pair) < 2:
             raise ValueError("Boundary point is not [x, y].")
-
-        points.append([float(p[0]), float(p[1])])
+        points.append([float(coordinate_pair[0]), float(coordinate_pair[1])])
 
     return _strip_closed_coordinate(points)
 
 
-def _strip_closed_coordinate(coords) -> list[list[float]]:
-    points = [[float(p[0]), float(p[1])] for p in coords]
-
-    if len(points) >= 2:
-        if (
-            abs(points[0][0] - points[-1][0]) < 1e-9
-            and abs(points[0][1] - points[-1][1]) < 1e-9
-        ):
-            points = points[:-1]
+def _strip_closed_coordinate(coordinates) -> list[list[float]]:
+    points = [[float(point[0]), float(point[1])] for point in coordinates]
+    if len(points) >= 2 and _points_are_equal(points[0], points[-1]):
+        points = points[:-1]
 
     if len(points) < 3:
         raise ValueError("A polygon needs at least three distinct points.")
-
     return points
 
 
-def write_boundary_points_compatible(path: Path, points: list[list[float]]) -> None:
-    path.write_text(
-        json.dumps(
-            {
-                "points": points,
-                "pixel_points": points,
-                "polygon_pixels": points,
-                "source": "approved",
-            },
-            indent=2,
-        ) + "\n",
-        encoding="utf-8",
+def _points_are_equal(first_point: list[float], second_point: list[float]) -> bool:
+    return (
+        abs(first_point[0] - second_point[0]) < COORDINATE_EQUALITY_TOLERANCE
+        and abs(first_point[1] - second_point[1]) < COORDINATE_EQUALITY_TOLERANCE
     )
+
+
+def write_boundary_points_compatible(
+    path: Path,
+    points: list[list[float]],
+    *,
+    source: str = "approved",
+) -> None:
+    """Write canonical points plus legacy aliases used by older project versions."""
+    cleaned_points = _strip_closed_coordinate(points)
+    write_json(
+        path,
+        {
+            "points": cleaned_points,
+            "pixel_points": cleaned_points,
+            "polygon_pixels": cleaned_points,
+            "source": source,
+        },
+    )
+
+
+# Compatibility alias for old local patches that imported this private name.
+_unique_dir = unique_directory

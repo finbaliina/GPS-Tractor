@@ -1,203 +1,176 @@
+"""Generate or regenerate a route from a farmer-approved field boundary."""
+
 from __future__ import annotations
 
-import json
-import os
 from pathlib import Path
 from types import SimpleNamespace
 
-import numpy as np
 from shapely.geometry import Polygon
 
-from farm_data import field_dir, read_boundary_points
-from route_planning import plan_route, save_route_plan
 from contour_planning import plan_contour_route, save_contour_route_plan
+from farm_data import field_dir, read_boundary_points
+from geometry_utils import clean_polygon
+from json_io import read_json, write_json
+from mapbox import mapbox_token_is_configured
+from route_planning import plan_route, save_route_plan
 from route_visualisation import draw_route
+from settings import settings
+from terrain import get_terrain, load_saved_terrain
+
+
+METRES_PER_PIXEL_KEYS = (
+    "metres_per_pixel",
+    "meters_per_pixel",
+    "m_per_pixel",
+)
 
 
 def regenerate_field_route(farm_id: str, field_id: str) -> dict:
+    """Rebuild a field route using its farmer-approved boundary.
+
+    SAM is never called here. Terrain is fetched at most once when it is missing
+    and setup is online; later regenerations use the saved local terrain files.
     """
-    Rebuild a field route using the farmer-approved boundary.
+    field_directory = field_dir(farm_id, field_id)
+    satellite_path = field_directory / "satellite.png"
+    metadata_path = field_directory / "metadata.json"
+    approved_boundary_path = field_directory / "field_boundary_approved.json"
 
-    This never calls SAM. If terrain has not yet been saved and internet is
-    available during setup, it can fetch terrain once; later regenerations use
-    the local terrain files. If terrain cannot be fetched, straight routing still works.
-    """
-    path = field_dir(farm_id, field_id)
+    _require_file(satellite_path, "This field has no saved satellite.png.")
+    _require_file(metadata_path, "This field has no saved metadata.json.")
+    _require_file(approved_boundary_path, "This field has no approved boundary.")
 
-    satellite_path = path / "satellite.png"
-    metadata_path = path / "metadata.json"
-    terrain_data_path = path / "terrain_data.npz"
-    terrain_json_path = path / "terrain.json"
-    approved_path = path / "field_boundary_approved.json"
+    approved_points = read_boundary_points(approved_boundary_path)
+    try:
+        field_polygon = clean_polygon(Polygon(approved_points))
+    except ValueError as exc:
+        raise RuntimeError("Approved field boundary is not a usable polygon.") from exc
 
-    if not satellite_path.exists():
-        raise FileNotFoundError("This field has no saved satellite.png.")
+    metadata = read_json(metadata_path)
+    image_metres_per_pixel = _metres_per_pixel_from_metadata(metadata)
 
-    if not metadata_path.exists():
-        raise FileNotFoundError("This field has no saved metadata.json.")
+    _fetch_terrain_if_needed(
+        field_directory=field_directory,
+        satellite_path=satellite_path,
+        metadata_path=metadata_path,
+        metres_per_pixel=image_metres_per_pixel,
+        field_polygon=field_polygon,
+    )
 
-    if not approved_path.exists():
-        raise FileNotFoundError("This field has no approved boundary.")
+    terrain_data = _load_terrain_if_available(field_directory)
+    route_mode, route_plan = _plan_route_for_available_terrain(
+        field_polygon=field_polygon,
+        metres_per_pixel=image_metres_per_pixel,
+        terrain_data=terrain_data,
+    )
 
-    points = read_boundary_points(approved_path)
-
-    polygon = Polygon(points)
-
-    if not polygon.is_valid:
-        polygon = polygon.buffer(0)
-
-    if polygon.is_empty:
-        raise RuntimeError("Approved field boundary is not a usable polygon.")
-
-    if polygon.geom_type == "MultiPolygon":
-        polygon = max(polygon.geoms, key=lambda p: p.area)
-
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    metres_per_pixel = _metres_per_pixel(metadata)
-
-    threshold = float(os.getenv("CONTOUR_SLOPE_THRESHOLD_DEG", "5.0"))
-
-    use_contour = False
-    terrain = None
-    p90_slope = None
-
-    if (
-        not (terrain_data_path.exists() and terrain_json_path.exists())
-        and _env_bool("AUTO_FETCH_TERRAIN", True)
-        and os.getenv("MAPBOX_TOKEN", "").strip()
-    ):
-        try:
-            from terrain import get_terrain
-
-            capture = SimpleNamespace(
-                folder=path,
-                image_path=satellite_path,
-                metadata_path=metadata_path,
-                metres_per_pixel=metres_per_pixel,
-            )
-            print("UI route: fetching terrain for this field once during setup...")
-            get_terrain(capture, polygon)
-        except Exception as exc:
-            print(f"UI route: terrain fetch unavailable ({exc}); using straight routing if needed.")
-
-    if terrain_data_path.exists() and terrain_json_path.exists():
-        terrain = _load_saved_terrain(
-            terrain_data_path=terrain_data_path,
-            terrain_json_path=terrain_json_path,
-        )
-
-        p90_slope = float(terrain.p90_slope_deg)
-        use_contour = p90_slope >= threshold
-
-    if use_contour:
-        print(
-            f"UI route: terrain p90 slope {p90_slope:.1f}° >= "
-            f"{threshold:.1f}°; using straight contour planner."
-        )
-        plan = plan_contour_route(
-            polygon,
-            terrain,
-            metres_per_pixel,
-        )
-        save_contour_route_plan(
-            plan,
-            path / "route_plan.json",
-        )
-        route_mode = getattr(plan, "mode", "contour")
+    route_plan_path = field_directory / "route_plan.json"
+    if route_mode == "straight":
+        save_route_plan(route_plan, route_plan_path)
     else:
-        if p90_slope is None:
-            print("UI route: no saved terrain data; using normal straight planner.")
-        else:
-            print(
-                f"UI route: terrain p90 slope {p90_slope:.1f}° < "
-                f"{threshold:.1f}°; using normal straight planner."
-            )
-
-        plan = plan_route(
-            polygon,
-            metres_per_pixel,
-        )
-        save_route_plan(
-            plan,
-            path / "route_plan.json",
-        )
-        route_mode = "straight"
+        save_contour_route_plan(route_plan, route_plan_path)
 
     draw_route(
         satellite_path,
-        polygon,
-        plan,
-        path / "route_overlay.png",
+        field_polygon,
+        route_plan,
+        field_directory / "route_overlay.png",
     )
-
-    _mark_route_current(
-        path=path,
-        route_mode=route_mode,
-    )
+    _mark_route_current(field_directory, route_mode)
 
     return {
         "ok": True,
         "route_mode": route_mode,
         "route_overlay": "route_overlay.png",
-        "passes": len(plan.swaths),
-        "turns": int(plan.turns),
-        "estimated_time_min": round(float(plan.estimated_time_s) / 60.0, 1),
+        "passes": len(route_plan.swaths),
+        "turns": int(route_plan.turns),
+        "estimated_time_min": round(route_plan.estimated_time_s / 60.0, 1),
     }
 
 
-def _load_saved_terrain(
-    terrain_data_path: Path,
-    terrain_json_path: Path,
-):
-    data = np.load(terrain_data_path)
-    summary = json.loads(terrain_json_path.read_text(encoding="utf-8"))
-
-    # This object deliberately exposes the same attributes used by
-    # contour_planning.py without downloading terrain again.
-    return SimpleNamespace(
-        elevation_grid=np.asarray(data["elevation_m"], dtype=np.float32),
-        slope_grid_deg=np.asarray(data["slope_deg"], dtype=np.float32),
-        field_mask=np.asarray(data["field_mask"], dtype=bool),
-        image_x=np.asarray(data["image_x"], dtype=float),
-        image_y=np.asarray(data["image_y"], dtype=float),
-        mean_slope_deg=float(summary.get("mean_slope_deg", 0.0)),
-        median_slope_deg=float(summary.get("median_slope_deg", 0.0)),
-        p90_slope_deg=float(summary.get("p90_slope_deg", 0.0)),
-        max_slope_deg=float(summary.get("max_slope_deg", 0.0)),
-        min_elevation_m=float(summary.get("min_elevation_m", 0.0)),
-        max_elevation_m=float(summary.get("max_elevation_m", 0.0)),
-        contour_interval_m=float(summary.get("contour_interval_m", 2.0)),
-        terrain_json_path=terrain_json_path,
-        data_path=terrain_data_path,
+def _fetch_terrain_if_needed(
+    field_directory: Path,
+    satellite_path: Path,
+    metadata_path: Path,
+    metres_per_pixel: float,
+    field_polygon: Polygon,
+) -> None:
+    terrain_files_exist = (
+        (field_directory / "terrain_data.npz").exists()
+        and (field_directory / "terrain.json").exists()
     )
-
-
-def _metres_per_pixel(metadata: dict) -> float:
-    for key in (
-        "metres_per_pixel",
-        "meters_per_pixel",
-        "m_per_pixel",
+    if (
+        terrain_files_exist
+        or not settings.terrain.auto_fetch
+        or not mapbox_token_is_configured()
     ):
-        if key in metadata:
-            return float(metadata[key])
+        return
 
-    image = metadata.get("image", {})
-    for key in (
-        "metres_per_pixel",
-        "meters_per_pixel",
-        "m_per_pixel",
-    ):
-        if key in image:
-            return float(image[key])
+    capture = SimpleNamespace(
+        folder=field_directory,
+        image_path=satellite_path,
+        metadata_path=metadata_path,
+        metres_per_pixel=metres_per_pixel,
+    )
+    try:
+        print("UI route: fetching terrain for this field once during setup...")
+        get_terrain(capture, field_polygon)
+    except Exception as exc:
+        # Terrain is useful but not required for a valid straight route.
+        print(
+            "UI route: terrain fetch unavailable "
+            f"({exc}); straight routing remains available."
+        )
 
-    mapbox = metadata.get("mapbox", {})
-    for key in (
-        "metres_per_pixel",
-        "meters_per_pixel",
-        "m_per_pixel",
+
+def _load_terrain_if_available(field_directory: Path):
+    has_terrain_data = (field_directory / "terrain_data.npz").exists()
+    has_terrain_summary = (field_directory / "terrain.json").exists()
+    if not (has_terrain_data and has_terrain_summary):
+        return None
+    return load_saved_terrain(field_directory)
+
+
+def _plan_route_for_available_terrain(
+    field_polygon: Polygon,
+    metres_per_pixel: float,
+    terrain_data,
+):
+    slope_threshold_deg = settings.terrain.contour_slope_threshold_deg
+
+    if terrain_data is None:
+        print("UI route: no saved terrain data; using normal straight planner.")
+        return "straight", plan_route(field_polygon, metres_per_pixel)
+
+    p90_slope_deg = terrain_data.p90_slope_deg
+    if p90_slope_deg >= slope_threshold_deg:
+        print(
+            f"UI route: terrain p90 slope {p90_slope_deg:.1f}° >= "
+            f"{slope_threshold_deg:.1f}°; using straight contour planner."
+        )
+        contour_plan = plan_contour_route(
+            field_polygon,
+            terrain_data,
+            metres_per_pixel,
+        )
+        return contour_plan.mode, contour_plan
+
+    print(
+        f"UI route: terrain p90 slope {p90_slope_deg:.1f}° < "
+        f"{slope_threshold_deg:.1f}°; using normal straight planner."
+    )
+    return "straight", plan_route(field_polygon, metres_per_pixel)
+
+
+def _metres_per_pixel_from_metadata(metadata: dict) -> float:
+    for container in (
+        metadata,
+        metadata.get("image", {}),
+        metadata.get("mapbox", {}),
     ):
-        if key in mapbox:
-            return float(mapbox[key])
+        for key in METRES_PER_PIXEL_KEYS:
+            if key in container:
+                return float(container[key])
 
     raise ValueError(
         "metadata.json does not contain metres_per_pixel. "
@@ -205,25 +178,18 @@ def _metres_per_pixel(metadata: dict) -> float:
     )
 
 
-def _mark_route_current(path: Path, route_mode: str) -> None:
-    field_json = path / "field.json"
-
-    if field_json.exists():
-        data = json.loads(field_json.read_text(encoding="utf-8"))
-    else:
-        data = {"name": path.name}
-
-    data["route_needs_regeneration"] = False
-    data["route_mode"] = route_mode
-
-    field_json.write_text(
-        json.dumps(data, indent=2) + "\n",
-        encoding="utf-8",
+def _mark_route_current(field_directory: Path, route_mode: str) -> None:
+    metadata_path = field_directory / "field.json"
+    field_metadata = (
+        read_json(metadata_path)
+        if metadata_path.exists()
+        else {"name": field_directory.name}
     )
+    field_metadata["route_needs_regeneration"] = False
+    field_metadata["route_mode"] = route_mode
+    write_json(metadata_path, field_metadata)
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+def _require_file(path: Path, error_message: str) -> None:
+    if not path.exists():
+        raise FileNotFoundError(error_message)
