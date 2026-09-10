@@ -6,6 +6,7 @@
   <a class="secondary button-link nav-button" href="{{ url_for('farm_page', farm_id=farm.id) }}">Back to farm</a>
 </div>
 
+{% if rescan_error %}<div class="route-result error">{{ rescan_error }}</div>{% endif %}
 {% if current %}
 <div class="review-layout">
   <section class="image-panel">
@@ -28,6 +29,13 @@
         </button>
       </div>
     </form>
+
+    <div class="action-grid single-action review-wide-action">
+      <form method="post" action="{{ url_for('rescan_sequential_field_wider', farm_id=farm.id) }}">
+        <button class="secondary" type="submit">Whole field not in image</button>
+      </form>
+    </div>
+    <p class="plain-help">Use this if the field is cut off by the edge of the picture. The app will fetch a wider view and scan it again.</p>
 
     <div class="action-grid review-action-grid">
       <form method="post" action="{{ url_for('duplicate_sequential_field', farm_id=farm.id) }}">

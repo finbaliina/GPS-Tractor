@@ -261,3 +261,17 @@ farm setup than automatically refining a very large candidate list.
 In the field editor, farmers can draw circular or square **avoid areas** around rocks, trees, wet patches or other obstacles. These are saved separately in `field_obstacles.json` and are cut out of the routeable field before route planning.
 
 The farm page also includes **Calculate all routes**, which regenerates routes for every saved field in that farm.
+
+## Clickable farm map and aligned obstacle rectangles
+
+Pending field suggestions on the farm progress map are clickable. Selecting an amber outline opens that specific suggestion for review. If another suggestion was already being displayed, it is returned to the waiting queue rather than discarded.
+
+The field boundary editor also includes **Draw rectangle**. This is a corner-to-corner, image-aligned rectangle: drag from one corner to the opposite corner and the sides remain horizontal/vertical on the satellite image. Circles and equal-sided squares remain available as separate obstacle tools.
+
+## Human-in-the-loop UI additions
+
+- Farm progress map can be panned and zoomed; pending field outlines remain clickable.
+- Farm-area setup map can be zoomed with the mouse wheel and panned with Shift + drag while normal dragging still draws search boxes.
+- Field review includes **Whole field not in image**, which retries the current field with a wider satellite view and a wider scan area.
+- Field editing has a separate **Areas to avoid** toolbox. Circle, square, axis-aligned rectangle and angled rectangle avoid areas are saved and excluded from route planning.
+- Angled rectangles are drawn in two steps: drag the first side to set direction and length, then click to set the width.

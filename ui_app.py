@@ -21,7 +21,14 @@ from farm_data import (
     save_boundary,
     save_field_obstacles,
 )
-from farm_setup import SETUP_CACHE, build_setup_preview, complete_setup, load_setup_preview
+from farm_setup import (
+    SETUP_CACHE,
+    build_setup_preview,
+    complete_setup,
+    load_setup_preview,
+    lonlat_to_pixel,
+    pixel_to_lonlat,
+)
 from field_discovery import (
     approve_candidate,
     approve_sequential_candidate,
@@ -29,12 +36,14 @@ from field_discovery import (
     get_next_sequential_candidate,
     list_candidates,
     prepare_sequential_discovery,
+    rescan_current_sequential_candidate,
     sequential_discovery_stats,
     set_candidate_status,
     set_sequential_candidate_status,
 )
 from field_routes import regenerate_field_route
 from settings import settings
+from json_io import read_json
 
 
 app = Flask(__name__)
@@ -43,6 +52,111 @@ DISCOVERY_JOBS: dict[str, dict] = {}
 DISCOVERY_JOBS_LOCK = threading.Lock()
 SEQUENTIAL_JOBS: dict[str, dict] = {}
 SEQUENTIAL_JOBS_LOCK = threading.Lock()
+
+
+def _polygon_rings_from_geojson_geometry(geometry: dict) -> list[list[list[float]]]:
+    """Return exterior rings from Polygon/MultiPolygon GeoJSON geometry."""
+    if not isinstance(geometry, dict):
+        return []
+    geometry_type = geometry.get("type")
+    coordinates = geometry.get("coordinates") or []
+    if geometry_type == "Polygon":
+        return [coordinates[0]] if coordinates and coordinates[0] else []
+    if geometry_type == "MultiPolygon":
+        return [polygon[0] for polygon in coordinates if polygon and polygon[0]]
+    return []
+
+
+def _points_for_svg(points: list[list[float]]) -> str:
+    return " ".join(f"{float(x):.1f},{float(y):.1f}" for x, y in points)
+
+
+def _build_farm_map_context(farm_id: str) -> dict | None:
+    """Project saved fields and remaining scan suggestions onto the farm overview."""
+    farm_directory = FARMS_DIR / farm_id
+    overview_path = farm_directory / "overview.png"
+    farm_metadata_path = farm_directory / "farm.json"
+    if not overview_path.exists() or not farm_metadata_path.exists():
+        return None
+
+    farm_metadata = read_json(farm_metadata_path)
+    overview_map = farm_metadata.get("overview_map")
+    if not isinstance(overview_map, dict):
+        return None
+
+    width = int(overview_map.get("width", 0))
+    height = int(overview_map.get("height", 0))
+    if width <= 0 or height <= 0:
+        return None
+
+    search_rings: list[str] = []
+    search_area_path = farm_directory / "farm_search_area.geojson"
+    if search_area_path.exists():
+        try:
+            search_geometry = read_json(search_area_path).get("geometry", {})
+            for ring in _polygon_rings_from_geojson_geometry(search_geometry):
+                projected = [lonlat_to_pixel(float(lon), float(lat), overview_map) for lon, lat in ring]
+                search_rings.append(_points_for_svg(projected))
+        except Exception:
+            app.logger.exception("Could not draw farm search area on overview")
+
+    saved_fields: list[dict] = []
+    fields_directory = farm_directory / "fields"
+    if fields_directory.exists():
+        for field_directory in sorted(path for path in fields_directory.iterdir() if path.is_dir()):
+            try:
+                field_metadata_path = field_directory / "field.json"
+                field_metadata = read_json(field_metadata_path) if field_metadata_path.exists() else {}
+                image_metadata = read_json(field_directory / "metadata.json")
+                local_map = {
+                    "centre_lat": image_metadata["position"]["latitude"],
+                    "centre_lon": image_metadata["position"]["longitude"],
+                    "zoom": image_metadata["zoom"],
+                    "width": image_metadata["width"],
+                    "height": image_metadata["height"],
+                }
+                boundary_path = field_directory / "field_boundary.json"
+                if not boundary_path.exists():
+                    boundary_path = field_directory / "field_boundary_approved.json"
+                boundary = read_json(boundary_path)
+                local_points = boundary.get("points") or boundary.get("pixel_points") or []
+                overview_points = []
+                for x, y in local_points:
+                    lon, lat = pixel_to_lonlat(float(x), float(y), local_map)
+                    overview_points.append(lonlat_to_pixel(lon, lat, overview_map))
+                if len(overview_points) >= 3:
+                    saved_fields.append({
+                        "id": field_directory.name,
+                        "name": field_metadata.get("name", field_directory.name),
+                        "points": _points_for_svg(overview_points),
+                    })
+            except Exception:
+                app.logger.exception("Could not project field %s onto farm overview", field_directory.name)
+
+    remaining_candidates: list[dict] = []
+    pool_path = farm_directory / "sequential_discovery" / "rough_pool.json"
+    if pool_path.exists():
+        try:
+            for candidate in read_json(pool_path).get("candidates", []):
+                if candidate.get("status", "unused") != "unused":
+                    continue
+                geometry = candidate.get("geometry_wgs84", {})
+                for ring in _polygon_rings_from_geojson_geometry(geometry):
+                    projected = [lonlat_to_pixel(float(lon), float(lat), overview_map) for lon, lat in ring]
+                    remaining_candidates.append({
+                        "id": candidate.get("id", "candidate"),
+                        "points": _points_for_svg(projected),
+                    })
+        except Exception:
+            app.logger.exception("Could not draw remaining field suggestions on farm overview")
+
+    return {
+        "width": width,
+        "height": height,
+        "saved_fields": saved_fields,
+        "remaining_candidates": remaining_candidates,
+        "search_rings": search_rings,
+    }
 
 
 def _update_discovery_job(farm_id: str, **changes) -> None:
@@ -170,6 +284,11 @@ def setup_complete(preview_id):
 @app.get("/farm/<farm_id>")
 def farm_page(farm_id):
     return _render_farm_page(farm_id)
+
+
+@app.get("/farm/<farm_id>/overview.png")
+def farm_overview_image(farm_id):
+    return send_file(FARMS_DIR / farm_id / "overview.png")
 
 
 @app.post("/farm/<farm_id>/discover-fields")
@@ -367,7 +486,18 @@ def sequential_fields(farm_id):
     return render_template(
         "sequential_fields.html", farm=get_farm(farm_id), current=current,
         stats=sequential_discovery_stats(farm_id),
+        rescan_error=request.args.get("rescan_error"),
     )
+
+
+@app.get("/farm/<farm_id>/sequential-fields/candidate/<candidate_id>")
+def review_sequential_candidate_from_map(farm_id, candidate_id):
+    """Open a specific waiting field selected from the farm map."""
+    try:
+        get_next_sequential_candidate(farm_id, preferred_rough_id=candidate_id)
+    except (FileNotFoundError, KeyError):
+        return redirect(url_for("farm_page", farm_id=farm_id))
+    return redirect(url_for("sequential_fields", farm_id=farm_id))
 
 
 @app.get("/farm/<farm_id>/sequential-fields/current/overlay.png")
@@ -386,6 +516,16 @@ def accept_sequential_field(farm_id):
 def accept_sequential_cv_boundary(farm_id):
     field_name = request.form.get("field_name", "")
     approve_sequential_candidate(farm_id, field_name)
+    return redirect(url_for("sequential_fields", farm_id=farm_id))
+
+
+@app.post("/farm/<farm_id>/sequential-fields/current/rescan-wider")
+def rescan_sequential_field_wider(farm_id):
+    try:
+        rescan_current_sequential_candidate(farm_id)
+    except Exception as error:
+        app.logger.exception("Could not rescan field with wider view")
+        return redirect(url_for("sequential_fields", farm_id=farm_id, rescan_error=str(error)))
     return redirect(url_for("sequential_fields", farm_id=farm_id))
 
 
@@ -534,6 +674,7 @@ def _render_farm_page(
         pending_candidate_count=pending_candidate_count,
         discovery_error=discovery_error,
         sequential_ready=(FARMS_DIR / farm_id / "sequential_discovery" / "rough_pool.json").exists(),
+        farm_map=_build_farm_map_context(farm_id),
     )
     return response, status_code
 

@@ -14,7 +14,8 @@
 
 <div class="setup-layout">
   <section class="map-panel">
-    <div id="farmAreaMap" class="map-wrap area-map-wrap">
+    <div id="farmAreaMap" class="map-wrap area-map-wrap panzoom-viewport">
+      <div id="farmAreaCanvas" class="panzoom-canvas">
       <img
         id="farmOverviewImage"
         src="{{ url_for('setup_overview_image', preview_id=preview.id) }}"
@@ -22,6 +23,7 @@
         draggable="false"
       >
       <svg id="farmAreaSvg" class="boundary-svg area-select-svg"></svg>
+      </div>
     </div>
   </section>
 
@@ -48,9 +50,8 @@
       <button class="primary huge" type="submit">Use these areas</button>
     </form>
 
-    <p class="muted small-copy">
-      These boxes tell the app where to look for fields.
-    </p>
+    <p class="muted small-copy">These boxes tell the app where to look for fields.</p>
+    <p class="muted small-copy">Scroll to zoom. Hold Shift and drag to move around the map.</p>
   </aside>
 </div>
 

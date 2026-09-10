@@ -43,6 +43,33 @@
 </section>
 {% endif %}
 
+
+{% if farm.setup_complete and farm_map %}
+<section class="simple-section">
+  <h2>Farm map</h2>
+  <p class="plain-help">Saved fields are shown in green. Fields still waiting to be reviewed are outlined in amber.</p>
+  <p class="map-help">Scroll to zoom. Drag the map to move around.</p>
+  <div class="farm-map-wrap panzoom-viewport">
+    <div class="farm-map-canvas panzoom-canvas">
+    <img class="farm-map-image" src="{{ url_for('farm_overview_image', farm_id=farm.id) }}" alt="Satellite map of {{ farm.name }}">
+    <svg class="farm-map-overlay" viewBox="0 0 {{ farm_map.width }} {{ farm_map.height }}" preserveAspectRatio="none" aria-label="Field progress map">
+      {% for points in farm_map.search_rings %}
+      <polygon class="farm-map-search-area" points="{{ points }}"></polygon>
+      {% endfor %}
+      {% for candidate in farm_map.remaining_candidates %}
+      <a class="farm-map-pending-link" href="{{ url_for('review_sequential_candidate_from_map', farm_id=farm.id, candidate_id=candidate.id) }}" aria-label="Review this field">
+        <polygon class="farm-map-pending" points="{{ candidate.points }}"><title>Click to review this field</title></polygon>
+      </a>
+      {% endfor %}
+      {% for field in farm_map.saved_fields %}
+      <polygon class="farm-map-saved" points="{{ field.points }}"><title>{{ field.name }}</title></polygon>
+      {% endfor %}
+    </svg>
+    </div>
+  </div>
+</section>
+{% endif %}
+
 <section class="simple-section">
   <h2>Saved fields</h2>
   {% if farm.fields %}
@@ -79,4 +106,5 @@
 </section>
 
 {% if farm.setup_complete %}<script src="{{ url_for('static', filename='sequential_progress.js') }}"></script>{% endif %}
+{% if farm.setup_complete and farm_map %}<script src="{{ url_for('static', filename='farm_map.js') }}"></script>{% endif %}
 {% endblock %}

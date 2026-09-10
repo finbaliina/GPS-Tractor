@@ -8,6 +8,9 @@
   const deleteButton = document.getElementById("deletePoint");
   const drawCircleButton = document.getElementById("drawCircle");
   const drawSquareButton = document.getElementById("drawSquare");
+  const drawRectangleButton = document.getElementById("drawRectangle");
+  const drawAngledRectangleButton = document.getElementById("drawAngledRectangle");
+  const angledRectangleHelp = document.getElementById("angledRectangleHelp");
   const deleteObstacleButton = document.getElementById("deleteObstacle");
   const undoButton = document.getElementById("undoButton");
   const resetButton = document.getElementById("resetButton");
@@ -33,6 +36,9 @@
   let dirty = false;
   let drawStart = null;
   let draftObstacle = null;
+  let angledBaseStart = null;
+  let angledBaseEnd = null;
+  let angledStage = 0;
 
   function clonePoints(value) {
     return (value || []).map(p => [Number(p[0]), Number(p[1])]);
@@ -65,12 +71,17 @@
     selectedObstacleIndex = null;
     drawStart = null;
     draftObstacle = null;
+    angledBaseStart = null;
+    angledBaseEnd = null;
+    angledStage = 0;
 
     const modeButtons = [
       [selectModeButton, "move"],
       [addModeButton, "add"],
       [drawCircleButton, "circle"],
-      [drawSquareButton, "square"]
+      [drawSquareButton, "square"],
+      [drawRectangleButton, "rectangle"],
+      [drawAngledRectangleButton, "angledRectangle"]
     ];
     modeButtons.forEach(([button, buttonMode]) => {
       button.classList.toggle("primary", mode === buttonMode);
@@ -78,7 +89,11 @@
     });
 
     svg.classList.toggle("add-mode", mode === "add");
-    svg.classList.toggle("draw-mode", mode === "circle" || mode === "square");
+    svg.classList.toggle("draw-mode", ["circle", "square", "rectangle", "angledRectangle"].includes(mode));
+    if (angledRectangleHelp) {
+      angledRectangleHelp.hidden = mode !== "angledRectangle";
+      if (mode === "angledRectangle") angledRectangleHelp.textContent = "Drag the first side, then click to set the rectangle width.";
+    }
     render();
   }
 
@@ -145,11 +160,43 @@
     ];
   }
 
+  function rectanglePoints(start, end) {
+    return [
+      [start[0], start[1]],
+      [end[0], start[1]],
+      [end[0], end[1]],
+      [start[0], end[1]]
+    ];
+  }
+
+  function angledRectanglePoints(start, end, widthPoint) {
+    const dx = end[0] - start[0];
+    const dy = end[1] - start[1];
+    const length = Math.sqrt(dx * dx + dy * dy);
+    if (length < 0.001) return [start, end, end, start];
+    const nx = -dy / length;
+    const ny = dx / length;
+    const width = (widthPoint[0] - start[0]) * nx + (widthPoint[1] - start[1]) * ny;
+    const ox = nx * width;
+    const oy = ny * width;
+    return [
+      [start[0], start[1]],
+      [end[0], end[1]],
+      [end[0] + ox, end[1] + oy],
+      [start[0] + ox, start[1] + oy]
+    ];
+  }
+
   function makeObstacle(shape, start, end) {
-    return {
-      shape,
-      points: shape === "circle" ? circlePoints(start, end) : squarePoints(start, end)
-    };
+    let obstaclePoints;
+    if (shape === "circle") {
+      obstaclePoints = circlePoints(start, end);
+    } else if (shape === "rectangle") {
+      obstaclePoints = rectanglePoints(start, end);
+    } else {
+      obstaclePoints = squarePoints(start, end);
+    }
+    return { shape, points: obstaclePoints };
   }
 
   function appendObstacleShape(obstacle, index, draft = false) {
@@ -236,6 +283,30 @@
   svg.addEventListener("pointerdown", event => {
     const target = event.target;
 
+    if (mode === "angledRectangle") {
+      const point = svgPointFromEvent(event);
+      if (angledStage === 1 && angledBaseStart && angledBaseEnd) {
+        const shape = { shape: "angledRectangle", points: angledRectanglePoints(angledBaseStart, angledBaseEnd, point) };
+        const width = Math.hypot(shape.points[3][0] - shape.points[0][0], shape.points[3][1] - shape.points[0][1]);
+        if (width >= 3) {
+          pushHistory();
+          obstacles.push(shape);
+          selectedObstacleIndex = obstacles.length - 1;
+          markDirty();
+        }
+        setMode("move");
+        return;
+      }
+      angledBaseStart = point;
+      angledBaseEnd = point;
+      drawStart = point;
+      angledStage = 0;
+      draftObstacle = { shape: "angledRectangle", points: angledRectanglePoints(point, point, point) };
+      svg.setPointerCapture(event.pointerId);
+      render();
+      return;
+    }
+
     if (target.classList.contains("exclusion-zone") && !target.classList.contains("draft")) {
       selectedObstacleIndex = Number(target.dataset.obstacleIndex);
       selectedIndex = null;
@@ -269,7 +340,7 @@
       return;
     }
 
-    if (mode === "circle" || mode === "square") {
+    if (mode === "circle" || mode === "square" || mode === "rectangle") {
       drawStart = svgPointFromEvent(event);
       draftObstacle = makeObstacle(mode, drawStart, drawStart);
       svg.setPointerCapture(event.pointerId);
@@ -278,13 +349,27 @@
   });
 
   svg.addEventListener("pointermove", event => {
+    if (mode === "angledRectangle") {
+      const point = svgPointFromEvent(event);
+      if (drawStart && angledBaseStart) {
+        angledBaseEnd = point;
+        draftObstacle = { shape: "angledRectangle", points: angledRectanglePoints(angledBaseStart, angledBaseEnd, angledBaseEnd) };
+        render();
+        return;
+      }
+      if (angledStage === 1 && angledBaseStart && angledBaseEnd) {
+        draftObstacle = { shape: "angledRectangle", points: angledRectanglePoints(angledBaseStart, angledBaseEnd, point) };
+        render();
+        return;
+      }
+    }
     if (draggingIndex !== null) {
       points[draggingIndex] = svgPointFromEvent(event);
       markDirty();
       render();
       return;
     }
-    if (drawStart && (mode === "circle" || mode === "square")) {
+    if (drawStart && (mode === "circle" || mode === "square" || mode === "rectangle")) {
       draftObstacle = makeObstacle(mode, drawStart, svgPointFromEvent(event));
       render();
     }
@@ -292,6 +377,21 @@
 
   svg.addEventListener("pointerup", event => {
     draggingIndex = null;
+    if (mode === "angledRectangle" && drawStart && angledBaseStart) {
+      angledBaseEnd = svgPointFromEvent(event);
+      const length = Math.hypot(angledBaseEnd[0] - angledBaseStart[0], angledBaseEnd[1] - angledBaseStart[1]);
+      drawStart = null;
+      try { svg.releasePointerCapture(event.pointerId); } catch (_) {}
+      if (length < 3) {
+        setMode("move");
+        return;
+      }
+      angledStage = 1;
+      draftObstacle = { shape: "angledRectangle", points: angledRectanglePoints(angledBaseStart, angledBaseEnd, angledBaseEnd) };
+      if (angledRectangleHelp) angledRectangleHelp.textContent = "Move the pointer to set the width, then click once.";
+      render();
+      return;
+    }
     if (!drawStart || !draftObstacle) return;
 
     const end = svgPointFromEvent(event);
@@ -306,6 +406,9 @@
     }
     drawStart = null;
     draftObstacle = null;
+    angledBaseStart = null;
+    angledBaseEnd = null;
+    angledStage = 0;
     setMode("move");
   });
 
@@ -313,6 +416,8 @@
   addModeButton.addEventListener("click", () => setMode("add"));
   drawCircleButton.addEventListener("click", () => setMode("circle"));
   drawSquareButton.addEventListener("click", () => setMode("square"));
+  drawRectangleButton.addEventListener("click", () => setMode("rectangle"));
+  drawAngledRectangleButton.addEventListener("click", () => setMode("angledRectangle"));
 
   deleteButton.addEventListener("click", () => {
     if (selectedIndex === null) return;

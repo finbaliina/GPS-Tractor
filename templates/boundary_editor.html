@@ -8,9 +8,7 @@
     <p>Adjust the field edge if needed, then accept your edits.</p>
   </div>
   <div class="card-actions">
-    {% if review_url %}
-    <a class="secondary button-link" href="{{ review_url }}">Back to field review</a>
-    {% endif %}
+    {% if review_url %}<a class="secondary button-link" href="{{ review_url }}">Back to field review</a>{% endif %}
     <a class="secondary button-link" href="{{ url_for('farm_page', farm_id=farm.id) }}">Back to farm</a>
   </div>
 </div>
@@ -18,78 +16,60 @@
 <div class="editor-layout">
   <section class="map-panel">
     <div id="mapWrap" class="map-wrap">
-      <img
-        id="satelliteImage"
-        src="{{ url_for('field_satellite', farm_id=farm.id, field_id=field.id) }}"
-        alt="Satellite field image"
-        draggable="false"
-      >
+      <img id="satelliteImage" src="{{ url_for('field_satellite', farm_id=farm.id, field_id=field.id) }}" alt="Satellite field image" draggable="false">
       <svg id="boundarySvg" class="boundary-svg"></svg>
     </div>
 
     <div id="routePreviewPanel" class="route-preview-panel" hidden>
-      <div class="route-preview-header">
-        <div>
-          <div class="eyebrow">Generated route</div>
-          <h2 id="routeSummary">Route ready</h2>
-        </div>
-      </div>
-      <img
-        id="routePreviewImage"
-        class="route-preview-image"
-        alt="Generated field route"
-      >
+      <div class="route-preview-header"><div><div class="eyebrow">Generated route</div><h2 id="routeSummary">Route ready</h2></div></div>
+      <img id="routePreviewImage" class="route-preview-image" alt="Generated field route">
     </div>
   </section>
 
-  <aside class="tool-panel">
-    <div class="tool-group">
-      <div class="eyebrow">Boundary tools</div>
-      <h2>Adjust field</h2>
-      <p class="muted">
-        Drag the white points to adjust the field edge. Draw circles or squares around rocks, trees or other areas the tractor should avoid.
-      </p>
-    </div>
-
-    <div class="tool-grid">
-      <button id="selectMode" class="primary">Move points</button>
-      <button id="addMode" class="secondary">Add point</button>
-      <button id="deletePoint" class="secondary">Delete point</button>
-      <button id="drawCircle" class="secondary">Draw circle</button>
-      <button id="drawSquare" class="secondary">Draw square</button>
-      <button id="deleteObstacle" class="secondary">Delete obstacle</button>
-      <button id="undoButton" class="secondary">Undo</button>
-    </div>
-
-    <div class="tool-group">
-      <label class="checkbox-row">
-        <input id="showDetected" type="checkbox" checked>
-        Show original scanned boundary
-      </label>
-    </div>
-
-    <div class="tool-group">
-      <div class="metric">
-        <span>Points</span>
-        <strong id="pointCount">0</strong>
+  <aside class="editor-sidebar">
+    <section class="tool-panel">
+      <div class="tool-group">
+        <div class="eyebrow">Field edge</div>
+        <h2>Adjust boundary</h2>
+        <p class="muted">Move, add or remove points until the green line follows the edge of the field.</p>
       </div>
-      <div class="metric">
-        <span>Avoid areas</span>
-        <strong id="obstacleCount">0</strong>
+      <div class="tool-grid">
+        <button id="selectMode" class="primary">Move points</button>
+        <button id="addMode" class="secondary">Add point</button>
+        <button id="deletePoint" class="secondary">Delete point</button>
+        <button id="undoButton" class="secondary">Undo</button>
       </div>
-      <div class="metric">
-        <span>Status</span>
-        <strong id="saveStatus">Not changed</strong>
+      <div class="tool-group">
+        <label class="checkbox-row"><input id="showDetected" type="checkbox" checked>Show original scanned boundary</label>
       </div>
-    </div>
+      <div class="tool-group">
+        <div class="metric"><span>Points</span><strong id="pointCount">0</strong></div>
+        <div class="metric"><span>Status</span><strong id="saveStatus">Not changed</strong></div>
+      </div>
+      <div id="routeResult" class="route-result" hidden></div>
+      <div class="tool-group bottom-actions">
+        <button id="resetButton" class="danger-outline">Reset boundary</button>
+        <button id="saveButton" class="secondary large">{% if review_url %}Accept edits{% else %}Save boundary{% endif %}</button>
+        <button id="generateButton" class="primary large">Save & generate route</button>
+      </div>
+    </section>
 
-    <div id="routeResult" class="route-result" hidden></div>
-
-    <div class="tool-group bottom-actions">
-      <button id="resetButton" class="danger-outline">Reset boundary</button>
-      <button id="saveButton" class="secondary large">{% if review_url %}Accept edits{% else %}Save boundary{% endif %}</button>
-      <button id="generateButton" class="primary large">Save & generate route</button>
-    </div>
+    <section class="tool-panel obstacle-toolbox">
+      <div class="tool-group">
+        <div class="eyebrow">Areas to avoid</div>
+        <h2>Keep the tractor out</h2>
+        <p class="muted">Draw around rocks, trees, ponds, wet ground or anything else inside the field that the tractor should drive around. These red areas are left out when routes are calculated.</p>
+      </div>
+      <div class="tool-grid">
+        <button id="drawCircle" class="secondary">Draw circle</button>
+        <button id="drawSquare" class="secondary">Draw square</button>
+        <button id="drawRectangle" class="secondary">Draw rectangle</button>
+        <button id="drawAngledRectangle" class="secondary">Angled rectangle</button>
+        <button id="deleteObstacle" class="secondary">Delete avoid area</button>
+      </div>
+      <p id="angledRectangleHelp" class="muted small-copy" hidden>Drag the first side, then click to set the rectangle width.</p>
+      <div class="metric"><span>Avoid areas</span><strong id="obstacleCount">0</strong></div>
+    </section>
   </aside>
 </div>
 
@@ -104,7 +84,4 @@ window.FIELD_EDITOR_CONFIG = {
 };
 </script>
 {% endblock %}
-
-{% block scripts %}
-<script src="{{ url_for('static', filename='boundary_editor.js') }}"></script>
-{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='boundary_editor.js') }}"></script>{% endblock %}

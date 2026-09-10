@@ -553,3 +553,111 @@ label { display: flex; flex-direction: column; gap: 7px; font-weight: 650; }
 .saved-fields-main-action { margin-bottom: 16px; }
 .saved-fields-main-action form,
 .saved-fields-main-action button { width: 100%; }
+
+
+/* Farm progress map */
+.plain-help {
+  margin: 0 0 0.85rem;
+  color: #555;
+}
+.farm-map-wrap {
+  position: relative;
+  width: 100%;
+  max-width: 980px;
+  overflow: hidden;
+  border-radius: 10px;
+  background: #e8e8e8;
+}
+.farm-map-image {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.farm-map-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+.farm-map-pending-link,
+.farm-map-pending {
+  pointer-events: auto;
+}
+.farm-map-pending-link {
+  cursor: pointer;
+}
+.farm-map-search-area {
+  fill: rgba(255,255,255,0.03);
+  stroke: rgba(255,255,255,0.9);
+  stroke-width: 3;
+  stroke-dasharray: 10 8;
+  vector-effect: non-scaling-stroke;
+}
+.farm-map-pending {
+  fill: rgba(255, 180, 0, 0.09);
+  stroke: rgba(255, 180, 0, 0.95);
+  stroke-width: 2.5;
+  vector-effect: non-scaling-stroke;
+  cursor: pointer;
+  transition: fill .12s ease, stroke-width .12s ease;
+}
+.farm-map-pending-link:hover .farm-map-pending {
+  fill: rgba(255, 180, 0, 0.24);
+  stroke-width: 4;
+}
+.farm-map-saved {
+  fill: rgba(45, 170, 85, 0.20);
+  stroke: rgba(45, 170, 85, 1);
+  stroke-width: 3;
+  vector-effect: non-scaling-stroke;
+}
+
+/* Clear editing toolboxes */
+.editor-sidebar {
+  display: grid;
+  gap: 16px;
+  align-self: start;
+}
+.editor-sidebar .tool-panel {
+  position: static;
+  background: #fff;
+  border: 1px solid #dce2d9;
+  border-radius: 18px;
+}
+.obstacle-toolbox {
+  border-left: 4px solid #b83d32 !important;
+}
+.obstacle-toolbox .tool-group:first-child { margin-bottom: 14px; }
+
+/* Zoomable farm maps */
+.panzoom-viewport {
+  position: relative;
+  overflow: hidden;
+  touch-action: none;
+  cursor: grab;
+}
+.panzoom-viewport.is-panning { cursor: grabbing; }
+.panzoom-canvas {
+  position: relative;
+  width: 100%;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+.map-help {
+  margin: -0.35rem 0 0.8rem;
+  color: #666;
+  font-size: 0.9rem;
+}
+.farm-map-canvas .farm-map-image { width: 100%; }
+.farm-map-canvas .farm-map-overlay { position: absolute; inset: 0; }
+.area-map-wrap .panzoom-canvas { position: relative; width: 100%; }
+.area-map-wrap .panzoom-canvas img { width: 100%; }
+.area-map-wrap .boundary-svg { position: absolute; inset: 0; }
+.review-wide-action { margin-top: 12px; }
+.review-wide-action form,
+.review-wide-action button { width: 100%; }
+
+@media (max-width: 850px) {
+  .editor-sidebar { grid-template-columns: 1fr; }
+}

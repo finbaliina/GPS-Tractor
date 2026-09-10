@@ -296,13 +296,15 @@ def _deduplicate_rough_candidates(candidates: list[RoughCandidate]) -> list[Roug
 
 def _refine_candidate(predictor, device_name: str, rough: RoughCandidate,
                       farm_directory: Path, index: int,
-                      bng_to_wgs84: Transformer) -> RefinedCandidate | None:
+                      bng_to_wgs84: Transformer,
+                      margin_multiplier: float = 1.0) -> RefinedCandidate | None:
     cfg = settings.field_discovery
     min_e, min_n, max_e, max_n = rough.geometry_bng.bounds
     field_width = max_e - min_e
     field_height = max_n - min_n
     margin_m = max(cfg.refinement_minimum_margin_m,
                    max(field_width, field_height) * cfg.refinement_margin_fraction)
+    margin_m *= max(1.0, float(margin_multiplier))
     min_e -= margin_m; min_n -= margin_m; max_e += margin_m; max_n += margin_m
     centre_e = (min_e + max_e) / 2.0
     centre_n = (min_n + max_n) / 2.0
@@ -329,7 +331,7 @@ def _refine_candidate(predictor, device_name: str, rough: RoughCandidate,
     rough_pixels = np.asarray([_bng_to_pixel(e, n, image_map) for e, n in rough.geometry_bng.exterior.coords[:-1]])
     box_left, box_top = np.min(rough_pixels, axis=0)
     box_right, box_bottom = np.max(rough_pixels, axis=0)
-    pad_px = cfg.refinement_box_padding_m / actual_mpp
+    pad_px = (cfg.refinement_box_padding_m * max(1.0, float(margin_multiplier))) / actual_mpp
     box_prompt = np.array([
         max(0.0, box_left-pad_px), max(0.0, box_top-pad_px),
         min(image_map.width_px-1.0, box_right+pad_px), min(image_map.height_px-1.0, box_bottom+pad_px)
@@ -631,22 +633,42 @@ def _sequential_paths(farm_id: str) -> tuple[Path, Path]:
     return directory / "rough_pool.json", directory / "current_candidate.json"
 
 
-def get_next_sequential_candidate(farm_id: str) -> dict[str, Any] | None:
-    """Return/refine the highest-ranked candidate not yet dealt with.
+def get_next_sequential_candidate(
+    farm_id: str, preferred_rough_id: str | None = None
+) -> dict[str, Any] | None:
+    """Return/refine the next candidate, or a farmer-selected map candidate.
 
-    Accepted configured fields act as exclusion polygons. Candidates that mostly
-    overlap an accepted field are skipped automatically.
+    With no preferred ID, the highest-ranked unused candidate is returned. When
+    ``preferred_rough_id`` is supplied (for example from the farm map), that
+    specific unused candidate is prepared instead. An already-presented current
+    candidate is put back into the queue so choosing a different field on the map
+    never silently discards it.
     """
     pool_path, current_path = _sequential_paths(farm_id)
-    if current_path.exists():
-        current = read_json(current_path)
-        if current.get("status") == "pending":
-            return current
     if not pool_path.exists():
         raise FileNotFoundError("Sequential discovery has not been prepared for this farm.")
 
     pool = read_json(pool_path)
     candidates = pool.get("candidates", [])
+
+    if current_path.exists():
+        current = read_json(current_path)
+        if current.get("status") == "pending":
+            if not preferred_rough_id or current.get("rough_id") == preferred_rough_id:
+                return current
+
+            # The farmer clicked another pending field on the map. Put the
+            # currently displayed proposal back into the unused queue.
+            current_rough_id = current.get("rough_id")
+            for item in candidates:
+                if item.get("id") == current_rough_id and item.get("status") == "presented":
+                    item["status"] = "unused"
+                    break
+            write_json(pool_path, pool)
+            if current_path.exists():
+                current_path.unlink()
+            shutil.rmtree(FARMS_DIR / farm_id / "sequential_discovery" / "current", ignore_errors=True)
+
     accepted_polygons = _configured_field_exclusion_polygons(farm_id)
     # A farmer-marked duplicate also represents an already-accounted-for area.
     # Rejected candidates are deliberately NOT added here: rejecting one bad
@@ -659,7 +681,14 @@ def get_next_sequential_candidate(farm_id: str) -> dict[str, Any] | None:
     exclusion_polygons = accepted_polygons + duplicate_polygons
 
     chosen = None
-    for item in candidates:
+    ordered_candidates = candidates
+    if preferred_rough_id:
+        selected = [item for item in candidates if item.get("id") == preferred_rough_id]
+        if not selected:
+            raise KeyError(f"Unknown field suggestion: {preferred_rough_id}")
+        ordered_candidates = selected
+
+    for item in ordered_candidates:
         if item.get("status", "unused") != "unused":
             continue
         polygon = shape(item["geometry_bng"])
@@ -709,7 +738,10 @@ def _overlap_fraction(candidate: Polygon, accepted: Polygon) -> float:
     return candidate.intersection(accepted).area / max(candidate.area, 1.0)
 
 
-def _refine_sequential_rough_candidate(farm_id: str, item: dict[str, Any]) -> dict[str, Any]:
+def _refine_sequential_rough_candidate(
+    farm_id: str, item: dict[str, Any], margin_multiplier: float = 1.0,
+    sequence_number: int | None = None,
+) -> dict[str, Any]:
     farm_directory = FARMS_DIR / farm_id
     bng_to_wgs84 = Transformer.from_crs(BRITISH_NATIONAL_GRID_EPSG, WGS84_EPSG, always_xy=True)
     overview_id = item.get("source_image_id", "overview_01")
@@ -728,15 +760,22 @@ def _refine_sequential_rough_candidate(farm_id: str, item: dict[str, Any]) -> di
     )
 
     predictor, device_name = create_image_predictor()
-    sequence_number = _next_sequential_number(farm_directory)
-    refined = _refine_candidate(predictor, device_name, rough, farm_directory, sequence_number, bng_to_wgs84)
+    if sequence_number is None:
+        sequence_number = _next_sequential_number(farm_directory)
+    refined = _refine_candidate(
+        predictor, device_name, rough, farm_directory, sequence_number, bng_to_wgs84,
+        margin_multiplier=margin_multiplier,
+    )
     if refined is None:
         raise RuntimeError("SAM could not refine the selected sequential candidate.")
 
     candidate_directory = farm_directory / "sequential_discovery" / "current"
     shutil.rmtree(candidate_directory, ignore_errors=True)
     candidate_directory.mkdir(parents=True, exist_ok=True)
-    _save_one_sequential_candidate(refined, candidate_directory, bng_to_wgs84, item["id"], sequence_number)
+    _save_one_sequential_candidate(
+        refined, candidate_directory, bng_to_wgs84, item["id"], sequence_number,
+        margin_multiplier=margin_multiplier,
+    )
     metadata = read_json(candidate_directory / "candidate.json")
     metadata["status"] = "pending"
     write_json(candidate_directory / "candidate.json", metadata)
@@ -753,7 +792,7 @@ def _next_sequential_number(farm_directory: Path) -> int:
 
 def _save_one_sequential_candidate(candidate: RefinedCandidate, path: Path,
                                    bng_to_wgs84: Transformer, rough_id: str,
-                                   number: int) -> None:
+                                   number: int, margin_multiplier: float = 1.0) -> None:
     visual = settings.visualisation
     shutil.copy2(candidate.refinement_image.image_path, path / "satellite.png")
     write_boundary_points_compatible(path / "field_boundary.json", candidate.pixel_points)
@@ -774,6 +813,8 @@ def _save_one_sequential_candidate(candidate: RefinedCandidate, path: Path,
         "map": {"centre_lat": map_image.centre_latitude_deg, "centre_lon": map_image.centre_longitude_deg,
                 "zoom": map_image.zoom, "width": map_image.width_px, "height": map_image.height_px},
         "geometry_wgs84": mapping(geometry_wgs84),
+        "refinement_margin_multiplier": float(margin_multiplier),
+        "sequence_number": int(number),
     })
     review = cv2.imread(str(path / "satellite.png"))
     if review is not None:
@@ -781,6 +822,33 @@ def _save_one_sequential_candidate(candidate: RefinedCandidate, path: Path,
         cv2.polylines(review, [contour], True, visual.candidate_boundary_colour_bgr,
                       visual.candidate_boundary_line_thickness_px, cv2.LINE_AA)
         cv2.imwrite(str(path / "overlay.png"), review)
+
+
+def rescan_current_sequential_candidate(farm_id: str) -> dict[str, Any]:
+    """Re-refine the currently presented field with a wider satellite view."""
+    farm_directory = FARMS_DIR / farm_id
+    pool_path, current_path = _sequential_paths(farm_id)
+    if not pool_path.exists() or not current_path.exists():
+        raise FileNotFoundError("There is no field waiting to be reviewed.")
+
+    current = read_json(current_path)
+    rough_id = current.get("rough_id")
+    pool = read_json(pool_path)
+    rough_item = next((item for item in pool.get("candidates", []) if item.get("id") == rough_id), None)
+    if rough_item is None:
+        raise KeyError(f"Could not find field suggestion {rough_id!r}.")
+
+    old_candidate_path = farm_directory / "sequential_discovery" / "current" / "candidate.json"
+    old_metadata = read_json(old_candidate_path) if old_candidate_path.exists() else current
+    old_multiplier = float(old_metadata.get("refinement_margin_multiplier", 1.0))
+    next_multiplier = min(old_multiplier * 1.75, 8.0)
+    sequence_number = int(old_metadata.get("sequence_number", 1))
+
+    refreshed = _refine_sequential_rough_candidate(
+        farm_id, rough_item, margin_multiplier=next_multiplier, sequence_number=sequence_number
+    )
+    write_json(current_path, refreshed)
+    return refreshed
 
 
 def set_sequential_candidate_status(farm_id: str, status: str) -> None:
