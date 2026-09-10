@@ -112,9 +112,23 @@ h2 { margin-bottom: 8px; }
 
 .farm-card {
   display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 14px;
+}
+
+.farm-card-main {
+  display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 16px;
+  color: inherit;
+  text-decoration: none;
 }
+
+.farm-card-main p { margin-bottom: 0; }
+.farm-card form { margin: 0; }
+.farm-delete { width: 100%; }
 
 .field-card { display: flex; flex-direction: column; gap: 20px; }
 .arrow { font-size: 28px; }

@@ -470,3 +470,310 @@ def _bng_to_pixel(easting_m: float, northing_m: float, map_image: MapImage) -> t
         float((easting_m - map_image.centre_easting_m) / map_image.metres_per_pixel + map_image.width_px / 2.0),
         float((map_image.centre_northing_m - northing_m) / map_image.metres_per_pixel + map_image.height_px / 2.0),
     )
+
+# ---------------------------------------------------------------------------
+# Experimental sequential discovery branch
+# ---------------------------------------------------------------------------
+
+def prepare_sequential_discovery(farm_id: str, force: bool = False, progress_callback=None) -> dict[str, Any]:
+    """Build a rough candidate pool once, without refining every candidate.
+
+    The pool is ranked by SAM confidence. Only one candidate is refined at a
+    time later, after previous farmer decisions have been taken into account.
+    """
+    farm_directory = FARMS_DIR / farm_id
+    state_directory = farm_directory / "sequential_discovery"
+    pool_path = state_directory / "rough_pool.json"
+    if force:
+        shutil.rmtree(state_directory, ignore_errors=True)
+    state_directory.mkdir(parents=True, exist_ok=True)
+
+    if pool_path.exists() and not force:
+        pool = read_json(pool_path)
+        return {"ok": True, "candidate_count": len(pool.get("candidates", [])), "reused": True}
+
+    search_area_path = farm_directory / "farm_search_area.geojson"
+    if not search_area_path.exists():
+        raise FileNotFoundError("This farm has no saved search area. Run farm setup first.")
+
+    _report_progress(progress_callback, 2, "Preparing sequential field scan...")
+    search_geometry_wgs84 = shape(read_json(search_area_path)["geometry"])
+    wgs84_to_bng = Transformer.from_crs(WGS84_EPSG, BRITISH_NATIONAL_GRID_EPSG, always_xy=True)
+    bng_to_wgs84 = Transformer.from_crs(BRITISH_NATIONAL_GRID_EPSG, WGS84_EPSG, always_xy=True)
+    search_geometry_bng = transform(wgs84_to_bng.transform, search_geometry_wgs84)
+    search_parts = _polygon_parts(search_geometry_bng)
+
+    _report_progress(progress_callback, 8, "Downloading overview imagery...")
+    overview_images = [
+        _build_overview_image(farm_directory, part, index, bng_to_wgs84)
+        for index, part in enumerate(search_parts, start=1)
+    ]
+    _report_progress(progress_callback, 15, "Loading SAM2 model...")
+    predictor, device_name = create_image_predictor()
+
+    rough_candidates: list[RoughCandidate] = []
+    for index, (overview, search_part) in enumerate(zip(overview_images, search_parts), start=1):
+        start = 20 + (index - 1) * 65 / max(len(overview_images), 1)
+        end = 20 + index * 65 / max(len(overview_images), 1)
+        rough_candidates.extend(_discover_in_overview(
+            predictor, device_name, overview, search_part,
+            progress_callback=progress_callback, progress_start=start, progress_end=end,
+        ))
+
+    # Keep only the light existing IoU deduplication here. The point of this
+    # branch is to let farmer decisions suppress later candidates dynamically.
+    rough_candidates = _deduplicate_rough_candidates(rough_candidates)
+    rough_candidates = sorted(rough_candidates, key=lambda c: c.sam_score, reverse=True)
+
+    serialised = []
+    for number, candidate in enumerate(rough_candidates, start=1):
+        geometry_wgs84 = transform(bng_to_wgs84.transform, candidate.geometry_bng)
+        prompt_point = candidate.geometry_bng.representative_point()
+        serialised.append({
+            "id": f"rough_{number:04d}",
+            "status": "unused",
+            "sam_score": candidate.sam_score,
+            "area_m2": candidate.area_m2,
+            "geometry_bng": mapping(candidate.geometry_bng),
+            "geometry_wgs84": mapping(geometry_wgs84),
+            "source_image_id": candidate.source_image.image_id,
+            "prompt_bng": [prompt_point.x, prompt_point.y],
+        })
+
+    write_json(pool_path, {
+        "architecture": "experimental_sequential_ranked_discovery",
+        "candidates": serialised,
+    })
+    write_json(state_directory / "decisions.json", {"accepted": [], "rejected": [], "duplicate": []})
+    _report_progress(progress_callback, 100, f"Sequential scan ready: {len(serialised)} rough possibilities ranked.")
+    return {"ok": True, "candidate_count": len(serialised), "reused": False}
+
+
+def _sequential_paths(farm_id: str) -> tuple[Path, Path]:
+    directory = FARMS_DIR / farm_id / "sequential_discovery"
+    return directory / "rough_pool.json", directory / "current_candidate.json"
+
+
+def get_next_sequential_candidate(farm_id: str) -> dict[str, Any] | None:
+    """Return/refine the highest-ranked candidate not yet dealt with.
+
+    Accepted configured fields act as exclusion polygons. Candidates that mostly
+    overlap an accepted field are skipped automatically.
+    """
+    pool_path, current_path = _sequential_paths(farm_id)
+    if current_path.exists():
+        current = read_json(current_path)
+        if current.get("status") == "pending":
+            return current
+    if not pool_path.exists():
+        raise FileNotFoundError("Sequential discovery has not been prepared for this farm.")
+
+    pool = read_json(pool_path)
+    candidates = pool.get("candidates", [])
+    accepted_polygons = _configured_field_exclusion_polygons(farm_id)
+    # A farmer-marked duplicate also represents an already-accounted-for area.
+    # Rejected candidates are deliberately NOT added here: rejecting one bad
+    # segmentation must not suppress a genuine field underneath it.
+    duplicate_polygons = [
+        clean_polygon(shape(item["geometry_bng"]))
+        for item in candidates
+        if item.get("status") == "duplicate"
+    ]
+    exclusion_polygons = accepted_polygons + duplicate_polygons
+
+    chosen = None
+    for item in candidates:
+        if item.get("status", "unused") != "unused":
+            continue
+        polygon = shape(item["geometry_bng"])
+        if any(_overlap_fraction(polygon, excluded) >= 0.55 for excluded in exclusion_polygons):
+            item["status"] = "suppressed_by_accepted_field"
+            continue
+        chosen = item
+        break
+    write_json(pool_path, pool)
+    if chosen is None:
+        if current_path.exists():
+            current_path.unlink()
+        return None
+
+    refined = _refine_sequential_rough_candidate(farm_id, chosen)
+    chosen["status"] = "presented"
+    for item in candidates:
+        if item["id"] == chosen["id"]:
+            item["status"] = "presented"
+            break
+    write_json(pool_path, pool)
+    write_json(current_path, refined)
+    return refined
+
+
+def _configured_field_exclusion_polygons(farm_id: str) -> list[Polygon]:
+    polygons: list[Polygon] = []
+    fields_directory = FARMS_DIR / farm_id / "fields"
+    if not fields_directory.exists():
+        return polygons
+    wgs84_to_bng = Transformer.from_crs(WGS84_EPSG, BRITISH_NATIONAL_GRID_EPSG, always_xy=True)
+    for directory in fields_directory.iterdir():
+        if not directory.is_dir():
+            continue
+        discovery_path = directory / "discovery_boundary.json"
+        if not discovery_path.exists():
+            continue
+        try:
+            geometry = shape(read_json(discovery_path)["geometry"])
+            polygons.append(clean_polygon(transform(wgs84_to_bng.transform, geometry)))
+        except Exception:
+            continue
+    return polygons
+
+
+def _overlap_fraction(candidate: Polygon, accepted: Polygon) -> float:
+    return candidate.intersection(accepted).area / max(candidate.area, 1.0)
+
+
+def _refine_sequential_rough_candidate(farm_id: str, item: dict[str, Any]) -> dict[str, Any]:
+    farm_directory = FARMS_DIR / farm_id
+    bng_to_wgs84 = Transformer.from_crs(BRITISH_NATIONAL_GRID_EPSG, WGS84_EPSG, always_xy=True)
+    overview_id = item.get("source_image_id", "overview_01")
+    overview_index = int(overview_id.split("_")[-1]) if "_" in overview_id else 1
+
+    search_geo = shape(read_json(farm_directory / "farm_search_area.geojson")["geometry"])
+    wgs84_to_bng = Transformer.from_crs(WGS84_EPSG, BRITISH_NATIONAL_GRID_EPSG, always_xy=True)
+    parts = _polygon_parts(transform(wgs84_to_bng.transform, search_geo))
+    source_part = parts[min(max(overview_index - 1, 0), len(parts) - 1)]
+    overview = _build_overview_image(farm_directory, source_part, overview_index, bng_to_wgs84)
+    rough = RoughCandidate(
+        geometry_bng=clean_polygon(shape(item["geometry_bng"])),
+        sam_score=float(item["sam_score"]),
+        source_image=overview,
+        area_m2=float(item["area_m2"]),
+    )
+
+    predictor, device_name = create_image_predictor()
+    sequence_number = _next_sequential_number(farm_directory)
+    refined = _refine_candidate(predictor, device_name, rough, farm_directory, sequence_number, bng_to_wgs84)
+    if refined is None:
+        raise RuntimeError("SAM could not refine the selected sequential candidate.")
+
+    candidate_directory = farm_directory / "sequential_discovery" / "current"
+    shutil.rmtree(candidate_directory, ignore_errors=True)
+    candidate_directory.mkdir(parents=True, exist_ok=True)
+    _save_one_sequential_candidate(refined, candidate_directory, bng_to_wgs84, item["id"], sequence_number)
+    metadata = read_json(candidate_directory / "candidate.json")
+    metadata["status"] = "pending"
+    write_json(candidate_directory / "candidate.json", metadata)
+    return metadata
+
+
+def _next_sequential_number(farm_directory: Path) -> int:
+    state_path = farm_directory / "sequential_discovery" / "counter.json"
+    current = read_json(state_path).get("value", 0) if state_path.exists() else 0
+    current += 1
+    write_json(state_path, {"value": current})
+    return current
+
+
+def _save_one_sequential_candidate(candidate: RefinedCandidate, path: Path,
+                                   bng_to_wgs84: Transformer, rough_id: str,
+                                   number: int) -> None:
+    visual = settings.visualisation
+    shutil.copy2(candidate.refinement_image.image_path, path / "satellite.png")
+    write_boundary_points_compatible(path / "field_boundary.json", candidate.pixel_points)
+    write_boundary_points_compatible(path / "field_boundary_detected.json", candidate.pixel_points)
+    write_json(path / "discovery_boundary.json", {
+        "coordinate_system": "EPSG:4326",
+        "geometry": mapping(transform(bng_to_wgs84.transform, candidate.discovery_geometry_bng)),
+        "purpose": "rough sequential SAM discovery boundary",
+    })
+    geometry_wgs84 = transform(bng_to_wgs84.transform, candidate.geometry_bng)
+    map_image = candidate.refinement_image
+    write_json(path / "candidate.json", {
+        "id": "current", "rough_id": rough_id, "status": "pending",
+        "suggested_name": f"Field no {number}", "sam_score": candidate.sam_score,
+        "area_ha": candidate.area_m2 / SQUARE_METRES_PER_HECTARE,
+        "metres_per_pixel": map_image.metres_per_pixel,
+        "vertex_count": len(candidate.pixel_points),
+        "map": {"centre_lat": map_image.centre_latitude_deg, "centre_lon": map_image.centre_longitude_deg,
+                "zoom": map_image.zoom, "width": map_image.width_px, "height": map_image.height_px},
+        "geometry_wgs84": mapping(geometry_wgs84),
+    })
+    review = cv2.imread(str(path / "satellite.png"))
+    if review is not None:
+        contour = np.rint(np.asarray(candidate.pixel_points)).astype(np.int32).reshape((-1, 1, 2))
+        cv2.polylines(review, [contour], True, visual.candidate_boundary_colour_bgr,
+                      visual.candidate_boundary_line_thickness_px, cv2.LINE_AA)
+        cv2.imwrite(str(path / "overlay.png"), review)
+
+
+def set_sequential_candidate_status(farm_id: str, status: str) -> None:
+    if status not in {"rejected", "duplicate"}:
+        raise ValueError("Sequential candidate status must be rejected or duplicate.")
+    pool_path, current_path = _sequential_paths(farm_id)
+    current = read_json(current_path)
+    rough_id = current["rough_id"]
+    pool = read_json(pool_path)
+    for item in pool.get("candidates", []):
+        if item["id"] == rough_id:
+            item["status"] = status
+            break
+    write_json(pool_path, pool)
+    if current_path.exists():
+        current_path.unlink()
+    shutil.rmtree(FARMS_DIR / farm_id / "sequential_discovery" / "current", ignore_errors=True)
+
+
+def approve_sequential_candidate(farm_id: str, field_name: str) -> dict[str, str]:
+    farm_directory = FARMS_DIR / farm_id
+    pool_path, current_path = _sequential_paths(farm_id)
+    current = read_json(current_path)
+    candidate_path = farm_directory / "sequential_discovery" / "current"
+    metadata = read_json(candidate_path / "candidate.json")
+    cleaned_name = field_name.strip() or metadata.get("suggested_name", "Field")
+    fields_directory = farm_directory / "fields"; fields_directory.mkdir(exist_ok=True)
+    new_field_directory = unique_directory(fields_directory, slugify(cleaned_name)); new_field_directory.mkdir()
+    for filename in ("satellite.png", "field_boundary.json", "field_boundary_detected.json", "discovery_boundary.json"):
+        source = candidate_path / filename
+        if source.exists():
+            shutil.copy2(source, new_field_directory / filename)
+    current_boundary = read_json(candidate_path / "field_boundary.json")["points"]
+    write_boundary_points_compatible(new_field_directory / "field_boundary_approved.json", current_boundary, source="cv_setup")
+    map_information = metadata["map"]
+    write_json(new_field_directory / "metadata.json", {
+        "position": {"latitude": map_information["centre_lat"], "longitude": map_information["centre_lon"]},
+        "zoom": map_information["zoom"], "width": map_information["width"], "height": map_information["height"],
+        "image_settings": {"zoom": map_information["zoom"], "width": map_information["width"], "height": map_information["height"]},
+        "name": cleaned_name, "source": "sequential_field_discovery",
+    })
+    field_id = new_field_directory.name
+    write_json(new_field_directory / "field.json", {
+        "name": cleaned_name, "boundary_source": "cv_setup", "boundary_locked": False,
+        "route_needs_regeneration": True, "source_candidate": current["rough_id"],
+        "source": "sequential_field_discovery",
+    })
+
+    pool = read_json(pool_path)
+    for item in pool.get("candidates", []):
+        if item["id"] == current["rough_id"]:
+            item["status"] = "accepted"
+            break
+    write_json(pool_path, pool)
+    if current_path.exists():
+        current_path.unlink()
+    shutil.rmtree(candidate_path, ignore_errors=True)
+    return {"id": field_id, "name": cleaned_name}
+
+
+def sequential_discovery_stats(farm_id: str) -> dict[str, int]:
+    pool_path, _ = _sequential_paths(farm_id)
+    if not pool_path.exists():
+        return {"total": 0, "unused": 0, "accepted": 0, "rejected": 0, "duplicate": 0, "suppressed": 0}
+    candidates = read_json(pool_path).get("candidates", [])
+    return {
+        "total": len(candidates),
+        "unused": sum(c.get("status", "unused") == "unused" for c in candidates),
+        "accepted": sum(c.get("status") == "accepted" for c in candidates),
+        "rejected": sum(c.get("status") == "rejected" for c in candidates),
+        "duplicate": sum(c.get("status") == "duplicate" for c in candidates),
+        "suppressed": sum(c.get("status") == "suppressed_by_accepted_field" for c in candidates),
+    }

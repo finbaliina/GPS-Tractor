@@ -9,6 +9,11 @@ from flask import Flask, jsonify, redirect, render_template, request, send_file,
 from farm_data import (
     FARMS_DIR,
     create_farm,
+<<<<<<< Updated upstream
+=======
+    delete_farm,
+    delete_field,
+>>>>>>> Stashed changes
     field_dir,
     get_farm,
     get_field,
@@ -21,9 +26,14 @@ from farm_data import (
 from farm_setup import SETUP_CACHE, build_setup_preview, complete_setup, load_setup_preview
 from field_discovery import (
     approve_candidate,
+    approve_sequential_candidate,
     discover_fields,
+    get_next_sequential_candidate,
     list_candidates,
+    prepare_sequential_discovery,
+    sequential_discovery_stats,
     set_candidate_status,
+    set_sequential_candidate_status,
 )
 from field_routes import regenerate_field_route
 from settings import settings
@@ -31,6 +41,45 @@ from settings import settings
 
 app = Flask(__name__)
 
+<<<<<<< Updated upstream
+=======
+DISCOVERY_JOBS: dict[str, dict] = {}
+DISCOVERY_JOBS_LOCK = threading.Lock()
+SEQUENTIAL_JOBS: dict[str, dict] = {}
+SEQUENTIAL_JOBS_LOCK = threading.Lock()
+
+
+def _update_discovery_job(farm_id: str, **changes) -> None:
+    with DISCOVERY_JOBS_LOCK:
+        current = DISCOVERY_JOBS.setdefault(farm_id, {})
+        current.update(changes)
+
+
+def _run_discovery_job(farm_id: str, force_rescan: bool) -> None:
+    def progress_update(progress: dict) -> None:
+        _update_discovery_job(farm_id, **progress)
+
+    try:
+        result = discover_fields(
+            farm_id, force=force_rescan, progress_callback=progress_update
+        )
+        _update_discovery_job(
+            farm_id,
+            running=False,
+            complete=True,
+            error=None,
+            percent=100,
+            message=f"Field scan complete: {result['candidate_count']} candidates ready to review.",
+            review_url=f"/farm/{farm_id}/review-fields",
+        )
+    except Exception as error:
+        app.logger.exception("Background field discovery failed")
+        _update_discovery_job(
+            farm_id, running=False, complete=False, error=str(error),
+            message=f"Field scan failed: {error}",
+        )
+
+>>>>>>> Stashed changes
 
 @app.get("/")
 def home():
@@ -43,6 +92,19 @@ def new_farm():
     farm_name = request.form.get("name", "")
     farm = create_farm(farm_name)
     return redirect(url_for("farm_page", farm_id=farm["id"]))
+
+
+@app.post("/farm/<farm_id>/delete")
+def delete_farm_route(farm_id):
+    with DISCOVERY_JOBS_LOCK:
+        running_job = DISCOVERY_JOBS.get(farm_id, {})
+        if running_job.get("running"):
+            return "Cannot delete a farm while field discovery is running.", 409
+
+    delete_farm(farm_id)
+    with DISCOVERY_JOBS_LOCK:
+        DISCOVERY_JOBS.pop(farm_id, None)
+    return redirect(url_for("home"))
 
 
 @app.route("/setup", methods=["GET", "POST"])
@@ -181,6 +243,102 @@ def add_field(farm_id):
     field_name = request.form.get("field_name", "")
     field = import_capture_as_field(farm_id, capture_id, field_name)
     return redirect(url_for("boundary_editor", farm_id=farm_id, field_id=field["id"]))
+
+
+
+def _update_sequential_job(farm_id: str, **changes) -> None:
+    with SEQUENTIAL_JOBS_LOCK:
+        current = SEQUENTIAL_JOBS.setdefault(farm_id, {})
+        current.update(changes)
+
+
+def _run_sequential_prepare_job(farm_id: str, force_rescan: bool) -> None:
+    def progress_update(progress: dict) -> None:
+        _update_sequential_job(farm_id, **progress)
+    try:
+        result = prepare_sequential_discovery(
+            farm_id, force=force_rescan, progress_callback=progress_update
+        )
+        _update_sequential_job(
+            farm_id, running=False, complete=True, error=None, percent=100,
+            message=f"Sequential scan ready: {result['candidate_count']} rough possibilities ranked.",
+            review_url=f"/farm/{farm_id}/sequential-fields",
+        )
+    except Exception as error:
+        app.logger.exception("Sequential field discovery failed")
+        _update_sequential_job(
+            farm_id, running=False, complete=False, error=str(error),
+            message=f"Sequential scan failed: {error}",
+        )
+
+
+@app.post("/api/farm/<farm_id>/sequential-fields/start")
+def start_sequential_discovery_job(farm_id):
+    with SEQUENTIAL_JOBS_LOCK:
+        existing = SEQUENTIAL_JOBS.get(farm_id, {})
+        if existing.get("running"):
+            return jsonify(existing)
+    force_rescan = request.form.get("force") == "1"
+    if request.is_json:
+        force_rescan = bool((request.get_json(silent=True) or {}).get("force", False))
+    _update_sequential_job(
+        farm_id, running=True, complete=False, error=None, percent=0,
+        message="Starting sequential field scan...", review_url=None,
+    )
+    worker = threading.Thread(
+        target=_run_sequential_prepare_job, args=(farm_id, force_rescan), daemon=True
+    )
+    worker.start()
+    return jsonify(SEQUENTIAL_JOBS[farm_id])
+
+
+@app.get("/api/farm/<farm_id>/sequential-fields/status")
+def sequential_discovery_job_status(farm_id):
+    with SEQUENTIAL_JOBS_LOCK:
+        status = dict(SEQUENTIAL_JOBS.get(farm_id, {
+            "running": False, "complete": False, "percent": 0,
+            "message": "No sequential field scan is running.", "error": None,
+        }))
+    return jsonify(status)
+
+
+@app.get("/farm/<farm_id>/sequential-fields")
+def sequential_fields(farm_id):
+    current = get_next_sequential_candidate(farm_id)
+    return render_template(
+        "sequential_fields.html", farm=get_farm(farm_id), current=current,
+        stats=sequential_discovery_stats(farm_id),
+    )
+
+
+@app.get("/farm/<farm_id>/sequential-fields/current/overlay.png")
+def sequential_candidate_overlay(farm_id):
+    return send_file(FARMS_DIR / farm_id / "sequential_discovery" / "current" / "overlay.png")
+
+
+@app.post("/farm/<farm_id>/sequential-fields/current/accept")
+def accept_sequential_field(farm_id):
+    field_name = request.form.get("field_name", "")
+    field = approve_sequential_candidate(farm_id, field_name)
+    return redirect(url_for("boundary_editor", farm_id=farm_id, field_id=field["id"]))
+
+
+@app.post("/farm/<farm_id>/sequential-fields/current/reject")
+def reject_sequential_field(farm_id):
+    set_sequential_candidate_status(farm_id, "rejected")
+    return redirect(url_for("sequential_fields", farm_id=farm_id))
+
+
+@app.post("/farm/<farm_id>/sequential-fields/current/duplicate")
+def duplicate_sequential_field(farm_id):
+    set_sequential_candidate_status(farm_id, "duplicate")
+    return redirect(url_for("sequential_fields", farm_id=farm_id))
+
+
+@app.post("/farm/<farm_id>/sequential-fields/reset")
+def reset_sequential_fields(farm_id):
+    prepare_sequential_discovery(farm_id, force=True)
+    return redirect(url_for("sequential_fields", farm_id=farm_id))
 
 
 @app.get("/farm/<farm_id>/field/<field_id>/edit")

@@ -41,6 +41,25 @@
     {% endif %}
   </div>
 </section>
+
+<section class="panel experimental-panel">
+  <div class="eyebrow">Experimental scanner</div>
+  <h2>Sequential field discovery</h2>
+  <p class="muted">Instead of refining every rough possibility, rank them by confidence and show one field at a time. Accepted fields suppress overlapping candidates from later in the queue.</p>
+  <div id="sequential-progress" class="discovery-progress" hidden
+       data-start-url="{{ url_for('start_sequential_discovery_job', farm_id=farm.id) }}"
+       data-status-url="{{ url_for('sequential_discovery_job_status', farm_id=farm.id) }}">
+    <div class="progress-heading"><strong id="sequential-progress-message">Starting sequential scan...</strong><span id="sequential-progress-percent">0%</span></div>
+    <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="sequential-progress-fill" class="progress-fill"></div></div>
+    <div id="sequential-progress-error" class="route-result error" hidden></div>
+  </div>
+  <div id="sequential-actions" class="discovery-actions">
+    <form class="sequential-discovery-form">
+      <button class="secondary large" type="submit">Start sequential scanner</button>
+    </form>
+    <a class="secondary button-link" href="{{ url_for('sequential_fields', farm_id=farm.id) }}">Continue existing sequential scan</a>
+  </div>
+</section>
 {% endif %}
 
 <div class="grid cards">
@@ -91,4 +110,8 @@
   <div class="empty-state">No usable captures found yet.</div>
   {% endif %}
 </section>
+<<<<<<< Updated upstream
+=======
+{% if farm.setup_complete %}<script src="{{ url_for('static', filename='discovery_progress.js') }}"></script><script src="{{ url_for('static', filename='sequential_progress.js') }}"></script>{% endif %}
+>>>>>>> Stashed changes
 {% endblock %}

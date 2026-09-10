@@ -95,6 +95,14 @@ def list_farms() -> list[dict[str, Any]]:
     return farms
 
 
+def delete_farm(farm_id: str) -> None:
+    """Permanently remove a farm and all locally stored data beneath it."""
+    farm_directory = FARMS_DIR / farm_id
+    if not farm_directory.exists() or not farm_directory.is_dir():
+        raise FileNotFoundError(farm_id)
+    shutil.rmtree(farm_directory)
+
+
 def create_farm(name: str) -> dict[str, str]:
     ensure_storage()
     cleaned_name = name.strip()

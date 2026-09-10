@@ -227,3 +227,34 @@ Tune with:
 Increasing a mask-score tolerance makes the scanner more willing to choose a
 slightly lower-confidence, smaller mask. Reducing it makes SAM confidence more
 dominant.
+<<<<<<< Updated upstream
+=======
+
+### Setup review and scan progress
+
+The farm setup UI now supports optional field naming during candidate review. If the name is left blank, the candidate is saved as `Field no X`. Candidates can also be marked as duplicates without creating another configured field.
+
+The farm overview shows a satellite thumbnail for every configured field and allows fields to be deleted (with confirmation). Automatic discovery runs through a background Flask worker and reports live progress to the farm page while SAM scans the overview and refines each candidate.
+
+## Experimental sequential discovery branch
+
+The farm page now also offers **Sequential field discovery**. This is deliberately
+kept separate from the normal whole-area -> refine-all scanner so both approaches
+can be compared on the same farm.
+
+The sequential branch:
+
+1. downloads/uses the same whole-area overview image;
+2. runs the overview SAM prompt grid once and ranks rough candidates by confidence;
+3. refines only the highest-ranked remaining candidate;
+4. asks the farmer to keep, reject or mark it as a duplicate;
+5. suppresses later rough candidates that substantially overlap an accepted field
+   or an area marked as a duplicate;
+6. does **not** suppress an entire area when a candidate is rejected, because a
+   rejected merged/bad mask may still contain valid fields that should appear later;
+7. repeats until the candidate pool is exhausted.
+
+This is an experimental branch, not a replacement for the main scanner. Its main
+purpose is to test whether human decisions made one field at a time give cleaner
+farm setup than automatically refining a very large candidate list.
+>>>>>>> Stashed changes
