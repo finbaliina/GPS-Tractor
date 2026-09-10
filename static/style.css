@@ -380,3 +380,46 @@ label { display: flex; flex-direction: column; gap: 7px; font-weight: 650; }
   .setup-layout { grid-template-columns: 1fr; }
   .farm-setup-summary { align-items:flex-start; flex-direction:column; }
 }
+
+/* Field review / overview additions */
+.compact-copy { margin-top: -4px; margin-bottom: 4px; }
+.review-secondary-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.review-secondary-actions form, .review-secondary-actions button { width: 100%; }
+
+.field-thumbnail-link {
+  display: block;
+  margin: -20px -20px 0;
+  overflow: hidden;
+  border-radius: 18px 18px 0 0;
+  background: #e7ebe4;
+}
+.field-thumbnail {
+  display: block;
+  width: 100%;
+  height: 170px;
+  object-fit: cover;
+}
+.field-card .card-actions { margin-top: auto; }
+
+.discovery-progress { margin-top: 18px; }
+.progress-heading { display: flex; justify-content: space-between; gap: 16px; margin-bottom: 8px; }
+.progress-track {
+  width: 100%;
+  height: 18px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e4e9e1;
+  border: 1px solid #d4dbd1;
+}
+.progress-fill {
+  width: 0;
+  height: 100%;
+  background: #1d5b37;
+  transition: width .25s ease;
+}
+.discovery-progress .route-result { margin-top: 12px; margin-bottom: 0; }
+
+@media (max-width: 600px) {
+  .review-progress { flex-wrap: wrap; gap: 10px 18px; }
+  .review-secondary-actions { grid-template-columns: 1fr; }
+}

@@ -227,8 +227,6 @@ Tune with:
 Increasing a mask-score tolerance makes the scanner more willing to choose a
 slightly lower-confidence, smaller mask. Reducing it makes SAM confidence more
 dominant.
-<<<<<<< Updated upstream
-=======
 
 ### Setup review and scan progress
 
@@ -257,4 +255,3 @@ The sequential branch:
 This is an experimental branch, not a replacement for the main scanner. Its main
 purpose is to test whether human decisions made one field at a time give cleaner
 farm setup than automatically refining a very large candidate list.
->>>>>>> Stashed changes
