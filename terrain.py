@@ -6,6 +6,11 @@ from pathlib import Path
 import math
 
 import cv2
+import matplotlib
+
+# Flask can generate terrain overlays from worker threads. Force Matplotlib to use
+# a non-interactive backend so it never creates Tkinter GUI objects.
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import requests
