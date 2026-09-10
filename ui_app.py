@@ -9,6 +9,7 @@ from flask import Flask, jsonify, redirect, render_template, request, send_file,
 from farm_data import (
     FARMS_DIR,
     create_farm,
+    delete_field,
     field_dir,
     get_farm,
     get_field,
@@ -30,6 +31,40 @@ from settings import settings
 
 
 app = Flask(__name__)
+
+DISCOVERY_JOBS: dict[str, dict] = {}
+DISCOVERY_JOBS_LOCK = threading.Lock()
+
+
+def _update_discovery_job(farm_id: str, **changes) -> None:
+    with DISCOVERY_JOBS_LOCK:
+        current = DISCOVERY_JOBS.setdefault(farm_id, {})
+        current.update(changes)
+
+
+def _run_discovery_job(farm_id: str, force_rescan: bool) -> None:
+    def progress_update(progress: dict) -> None:
+        _update_discovery_job(farm_id, **progress)
+
+    try:
+        result = discover_fields(
+            farm_id, force=force_rescan, progress_callback=progress_update
+        )
+        _update_discovery_job(
+            farm_id,
+            running=False,
+            complete=True,
+            error=None,
+            percent=100,
+            message=f"Field scan complete: {result['candidate_count']} candidates ready to review.",
+            review_url=f"/farm/{farm_id}/review-fields",
+        )
+    except Exception as error:
+        app.logger.exception("Background field discovery failed")
+        _update_discovery_job(
+            farm_id, running=False, complete=False, error=str(error),
+            message=f"Field scan failed: {error}",
+        )
 
 
 @app.get("/")
@@ -127,6 +162,38 @@ def discover_farm_fields(farm_id):
     return redirect(url_for("review_fields", farm_id=farm_id))
 
 
+@app.post("/api/farm/<farm_id>/discover-fields/start")
+def start_discovery_job(farm_id):
+    with DISCOVERY_JOBS_LOCK:
+        existing = DISCOVERY_JOBS.get(farm_id, {})
+        if existing.get("running"):
+            return jsonify(existing)
+
+    force_rescan = request.form.get("force") == "1"
+    if request.is_json:
+        force_rescan = bool((request.get_json(silent=True) or {}).get("force", False))
+
+    _update_discovery_job(
+        farm_id, running=True, complete=False, error=None, percent=0,
+        message="Starting field scan...", review_url=None,
+    )
+    worker = threading.Thread(
+        target=_run_discovery_job, args=(farm_id, force_rescan), daemon=True
+    )
+    worker.start()
+    return jsonify(DISCOVERY_JOBS[farm_id])
+
+
+@app.get("/api/farm/<farm_id>/discover-fields/status")
+def discovery_job_status(farm_id):
+    with DISCOVERY_JOBS_LOCK:
+        status = dict(DISCOVERY_JOBS.get(farm_id, {
+            "running": False, "complete": False, "percent": 0,
+            "message": "No field scan is running.", "error": None,
+        }))
+    return jsonify(status)
+
+
 @app.get("/farm/<farm_id>/review-fields")
 def review_fields(farm_id):
     all_candidates = list_candidates(farm_id)
@@ -143,6 +210,9 @@ def review_fields(farm_id):
         ),
         "rejected": sum(
             candidate.get("status") == "rejected" for candidate in all_candidates
+        ),
+        "duplicate": sum(
+            candidate.get("status") == "duplicate" for candidate in all_candidates
         ),
     }
 
@@ -173,6 +243,18 @@ def accept_candidate(farm_id, candidate_id):
 def reject_candidate(farm_id, candidate_id):
     set_candidate_status(farm_id, candidate_id, "rejected")
     return redirect(url_for("review_fields", farm_id=farm_id))
+
+
+@app.post("/farm/<farm_id>/candidate/<candidate_id>/duplicate")
+def duplicate_candidate(farm_id, candidate_id):
+    set_candidate_status(farm_id, candidate_id, "duplicate")
+    return redirect(url_for("review_fields", farm_id=farm_id))
+
+
+@app.post("/farm/<farm_id>/field/<field_id>/delete")
+def delete_farm_field(farm_id, field_id):
+    delete_field(farm_id, field_id)
+    return redirect(url_for("farm_page", farm_id=farm_id))
 
 
 @app.post("/farm/<farm_id>/fields")

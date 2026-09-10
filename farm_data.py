@@ -233,6 +233,12 @@ def field_dir(farm_id: str, field_id: str) -> Path:
     return field_directory
 
 
+
+def delete_field(farm_id: str, field_id: str) -> None:
+    """Permanently remove a configured field from a farm."""
+    field_directory = field_dir(farm_id, field_id)
+    shutil.rmtree(field_directory)
+
 def get_field(farm_id: str, field_id: str) -> dict[str, Any]:
     field_directory = field_dir(farm_id, field_id)
     metadata_path = field_directory / "field.json"

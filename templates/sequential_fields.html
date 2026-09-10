@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Sequential field discovery · {{ farm.name }}{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <div class="eyebrow">Experimental branch</div>
+    <h1>Sequential field discovery</h1>
+    <p>{{ farm.name }} · one candidate at a time, ranked by SAM confidence</p>
+  </div>
+  <a class="secondary button-link" href="{{ url_for('farm_page', farm_id=farm.id) }}">Back to farm</a>
+</div>
+
+<section class="panel">
+  <div class="status-row">
+    <span class="status ok">{{ stats.accepted }} accepted</span>
+    <span class="status">{{ stats.rejected }} rejected</span>
+    <span class="status">{{ stats.duplicate }} duplicates</span>
+    <span class="status">{{ stats.suppressed }} auto-suppressed</span>
+    <span class="status">{{ stats.unused }} rough candidates remaining</span>
+  </div>
+  <p class="muted">Accepting a field excludes later rough candidates that substantially overlap it. Rejecting or marking a duplicate suppresses only the current candidate.</p>
+</section>
+
+{% if current %}
+<div class="review-layout">
+  <section class="image-panel">
+    <img class="review-image" src="{{ url_for('sequential_candidate_overlay', farm_id=farm.id) }}?r={{ current.rough_id }}" alt="Current sequential field candidate">
+  </section>
+  <aside class="tool-panel">
+    <div class="eyebrow">Next highest-confidence candidate</div>
+    <h2>{{ current.suggested_name }}</h2>
+    <div class="metric"><span>Area</span><strong>{{ '%.1f'|format(current.area_ha) }} ha</strong></div>
+    <div class="metric"><span>SAM score</span><strong>{{ '%.3f'|format(current.sam_score) }}</strong></div>
+
+    <form method="post" action="{{ url_for('accept_sequential_field', farm_id=farm.id) }}" class="stack-form review-form">
+      <label>Field name (optional)
+        <input name="field_name" placeholder="{{ current.suggested_name }}" autocomplete="off">
+      </label>
+      <p class="muted small-copy compact-copy">Leave blank to use <strong>{{ current.suggested_name }}</strong>.</p>
+      <button class="primary huge" type="submit">Keep field & review boundary</button>
+    </form>
+
+    <div class="review-secondary-actions">
+      <form method="post" action="{{ url_for('duplicate_sequential_field', farm_id=farm.id) }}">
+        <button class="secondary" type="submit">Duplicate</button>
+      </form>
+      <form method="post" action="{{ url_for('reject_sequential_field', farm_id=farm.id) }}">
+        <button class="secondary" type="submit">Reject candidate</button>
+      </form>
+    </div>
+  </aside>
+</div>
+{% else %}
+<section class="panel">
+  <h2>No more candidates</h2>
+  <p>The ranked rough candidate pool has been exhausted after accepted-field exclusions and your decisions.</p>
+  <a class="primary button-link" href="{{ url_for('farm_page', farm_id=farm.id) }}">Return to farm</a>
+</section>
+{% endif %}
+{% endblock %}

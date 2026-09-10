@@ -65,9 +65,10 @@ class RefinedCandidate:
     area_m2: float
 
 
-def discover_fields(farm_id: str, force: bool = False) -> dict[str, Any]:
+def discover_fields(farm_id: str, force: bool = False, progress_callback=None) -> dict[str, Any]:
     """Find and refine fields in the farm's saved search area."""
     farm_directory = FARMS_DIR / farm_id
+    _report_progress(progress_callback, 1, "Preparing field scan...")
     search_area_path = farm_directory / "farm_search_area.geojson"
     if not search_area_path.exists():
         raise FileNotFoundError("This farm has no saved search area. Run farm setup first.")
@@ -91,30 +92,44 @@ def discover_fields(farm_id: str, force: bool = False) -> dict[str, Any]:
     search_geometry_bng = transform(wgs84_to_bng.transform, search_geometry_wgs84)
 
     search_parts = _polygon_parts(search_geometry_bng)
+    _report_progress(progress_callback, 5, "Downloading overview imagery...")
     overview_images = [
         _build_overview_image(farm_directory, part, index, bng_to_wgs84)
         for index, part in enumerate(search_parts, start=1)
     ]
 
+    _report_progress(progress_callback, 12, "Loading SAM2 model...")
     predictor, device_name = create_image_predictor()
+    _report_progress(progress_callback, 18, "Scanning overview for rough field outlines...")
     rough_candidates: list[RoughCandidate] = []
     for index, (overview, search_part) in enumerate(zip(overview_images, search_parts), start=1):
         print(f"Rough field discovery {index}/{len(overview_images)}: {overview.image_id}")
+        overview_start = 18 + (index - 1) * 22 / max(len(overview_images), 1)
+        overview_end = 18 + index * 22 / max(len(overview_images), 1)
         rough_candidates.extend(
-            _discover_in_overview(predictor, device_name, overview, search_part)
+            _discover_in_overview(
+                predictor, device_name, overview, search_part,
+                progress_callback=progress_callback,
+                progress_start=overview_start,
+                progress_end=overview_end,
+            )
         )
     rough_candidates = _deduplicate_rough_candidates(rough_candidates)
 
     print(f"Rough discovery found {len(rough_candidates)} candidate fields. Refining...")
+    _report_progress(progress_callback, 40, f"Found {len(rough_candidates)} candidates. Refining field outlines...")
     refined_candidates: list[RefinedCandidate] = []
     for index, rough_candidate in enumerate(rough_candidates, start=1):
         print(f"Refining field {index}/{len(rough_candidates)}...")
+        refine_percent = 40 + 52 * (index - 1) / max(len(rough_candidates), 1)
+        _report_progress(progress_callback, refine_percent, f"Refining field {index} of {len(rough_candidates)}...")
         refined = _refine_candidate(
             predictor, device_name, rough_candidate, farm_directory, index, bng_to_wgs84
         )
         if refined is not None:
             refined_candidates.append(refined)
 
+    _report_progress(progress_callback, 94, "Saving candidate fields...")
     _save_candidate_queue(refined_candidates, candidate_directory, bng_to_wgs84)
     summary = {
         "ok": True,
@@ -125,7 +140,17 @@ def discover_fields(farm_id: str, force: bool = False) -> dict[str, Any]:
         "architecture": "whole_area_then_per_field_refinement",
     }
     write_json(farm_directory / "field_discovery.json", summary)
+    _report_progress(progress_callback, 100, f"Field scan complete: {len(refined_candidates)} candidates ready to review.")
     return summary
+
+
+def _report_progress(progress_callback, percent: float, message: str) -> None:
+    if progress_callback is None:
+        return
+    progress_callback({
+        "percent": max(0, min(100, int(round(percent)))),
+        "message": message,
+    })
 
 
 def _polygon_parts(geometry) -> list[Polygon]:
@@ -172,7 +197,10 @@ def _build_overview_image(
                     actual_mpp, image_path)
 
 
-def _discover_in_overview(predictor, device_name: str, overview: MapImage, search_polygon: Polygon) -> list[RoughCandidate]:
+def _discover_in_overview(
+    predictor, device_name: str, overview: MapImage, search_polygon: Polygon,
+    progress_callback=None, progress_start: float = 0.0, progress_end: float = 1.0,
+) -> list[RoughCandidate]:
     image = cv2.imread(str(overview.image_path))
     if image is None:
         raise RuntimeError(f"Could not read discovery image {overview.image_path}")
@@ -180,15 +208,24 @@ def _discover_in_overview(predictor, device_name: str, overview: MapImage, searc
     cfg = settings.field_discovery
     spacing_px = max(cfg.discovery_minimum_prompt_spacing_px,
                      int(round(cfg.discovery_prompt_spacing_m / overview.metres_per_pixel)))
-    candidates: list[RoughCandidate] = []
+    prompt_positions: list[tuple[int, int]] = []
     for y in range(spacing_px // 2, overview.height_px, spacing_px):
         for x in range(spacing_px // 2, overview.width_px, spacing_px):
             easting, northing = _pixel_to_bng(x, y, overview)
-            if not search_polygon.covers(Point(easting, northing)):
-                continue
-            candidate = _rough_candidate_at_prompt(predictor, device_name, overview, search_polygon, x, y)
-            if candidate is not None:
-                candidates.append(candidate)
+            if search_polygon.covers(Point(easting, northing)):
+                prompt_positions.append((x, y))
+
+    candidates: list[RoughCandidate] = []
+    total_prompts = max(len(prompt_positions), 1)
+    for prompt_number, (x, y) in enumerate(prompt_positions, start=1):
+        candidate = _rough_candidate_at_prompt(predictor, device_name, overview, search_polygon, x, y)
+        if candidate is not None:
+            candidates.append(candidate)
+        progress = progress_start + (progress_end - progress_start) * prompt_number / total_prompts
+        _report_progress(
+            progress_callback, progress,
+            f"Scanning overview: prompt {prompt_number} of {len(prompt_positions)}...",
+        )
     return candidates
 
 
@@ -384,7 +421,7 @@ def _save_candidate_queue(candidates: list[RefinedCandidate], candidate_director
         geometry_wgs84 = transform(bng_to_wgs84.transform, candidate.geometry_bng)
         map_image = candidate.refinement_image
         write_json(path / "candidate.json", {
-            "id": candidate_id, "status": "pending", "suggested_name": f"Field {number}",
+            "id": candidate_id, "status": "pending", "suggested_name": f"Field no {number}",
             "sam_score": candidate.sam_score,
             "area_ha": candidate.area_m2 / SQUARE_METRES_PER_HECTARE,
             "context": "refined from whole-area discovery",
@@ -416,7 +453,7 @@ def list_candidates(farm_id: str) -> list[dict[str, Any]]:
 
 
 def set_candidate_status(farm_id: str, candidate_id: str, status: str) -> None:
-    if status not in {"pending", "accepted", "rejected"}:
+    if status not in {"pending", "accepted", "rejected", "duplicate"}:
         raise ValueError("Unknown candidate status.")
     path = FARMS_DIR / farm_id / "field_candidates" / candidate_id / "candidate.json"
     metadata = read_json(path); metadata["status"] = status; write_json(path, metadata)
@@ -427,7 +464,8 @@ def approve_candidate(farm_id: str, candidate_id: str, field_name: str) -> dict[
     candidate_path = farm_directory / "field_candidates" / candidate_id
     if not candidate_path.exists():
         raise FileNotFoundError(candidate_id)
-    cleaned_name = field_name.strip() or candidate_id.replace("_", " ").title()
+    candidate_metadata = read_json(candidate_path / "candidate.json")
+    cleaned_name = field_name.strip() or candidate_metadata.get("suggested_name") or candidate_id.replace("_", " ").title()
     fields_directory = farm_directory / "fields"; fields_directory.mkdir(exist_ok=True)
     new_field_directory = unique_directory(fields_directory, slugify(cleaned_name)); new_field_directory.mkdir()
     for filename in ("satellite.png", "field_boundary.json", "field_boundary_detected.json", "discovery_boundary.json"):
@@ -436,7 +474,6 @@ def approve_candidate(farm_id: str, candidate_id: str, field_name: str) -> dict[
             shutil.copy2(source, new_field_directory / filename)
     current_boundary = read_json(candidate_path / "field_boundary.json")["points"]
     write_boundary_points_compatible(new_field_directory / "field_boundary_approved.json", current_boundary, source="cv_setup")
-    candidate_metadata = read_json(candidate_path / "candidate.json")
     map_information = candidate_metadata["map"]
     write_json(new_field_directory / "metadata.json", {
         "position": {"latitude": map_information["centre_lat"], "longitude": map_information["centre_lon"]},

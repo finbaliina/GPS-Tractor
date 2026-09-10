@@ -13,6 +13,7 @@
 <div class="review-progress panel">
   <strong>{{ counts.pending }} pending</strong>
   <span>{{ counts.accepted }} accepted</span>
+  <span>{{ counts.duplicate }} duplicate{% if counts.duplicate != 1 %}s{% endif %}</span>
   <span>{{ counts.rejected }} rejected</span>
 </div>
 
@@ -28,13 +29,23 @@
     <div class="metric"><span>SAM score</span><strong>{{ '%.2f'|format(current.sam_score) }}</strong></div>
 
     <form method="post" action="{{ url_for('accept_candidate', farm_id=farm.id, candidate_id=current.id) }}" class="stack-form review-form">
-      <label>Field name<input name="field_name" value="{{ current.suggested_name }}"></label>
+      <label>
+        Field name (optional)
+        <input name="field_name" placeholder="{{ current.suggested_name }}" autocomplete="off">
+      </label>
+      <p class="muted small-copy compact-copy">Leave this blank and it will be saved as <strong>{{ current.suggested_name }}</strong>.</p>
       <button class="primary huge" type="submit">Keep field & review boundary</button>
     </form>
-    <form method="post" action="{{ url_for('reject_candidate', farm_id=farm.id, candidate_id=current.id) }}">
-      <button class="secondary huge" type="submit">Not one of my fields</button>
-    </form>
-    <p class="muted small-copy">Keeping a field opens the existing boundary editor before its route is generated.</p>
+
+    <div class="review-secondary-actions">
+      <form method="post" action="{{ url_for('duplicate_candidate', farm_id=farm.id, candidate_id=current.id) }}">
+        <button class="secondary" type="submit">Mark as duplicate</button>
+      </form>
+      <form method="post" action="{{ url_for('reject_candidate', farm_id=farm.id, candidate_id=current.id) }}">
+        <button class="secondary" type="submit">Not one of my fields</button>
+      </form>
+    </div>
+    <p class="muted small-copy">A duplicate is kept in the scan record but will not create another configured field.</p>
   </aside>
 </div>
 {% else %}

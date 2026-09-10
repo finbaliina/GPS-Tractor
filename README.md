@@ -227,3 +227,9 @@ Tune with:
 Increasing a mask-score tolerance makes the scanner more willing to choose a
 slightly lower-confidence, smaller mask. Reducing it makes SAM confidence more
 dominant.
+
+### Setup review and scan progress
+
+The farm setup UI now supports optional field naming during candidate review. If the name is left blank, the candidate is saved as `Field no X`. Candidates can also be marked as duplicates without creating another configured field.
+
+The farm overview shows a satellite thumbnail for every configured field and allows fields to be deleted (with confirmation). Automatic discovery runs through a background Flask worker and reports live progress to the farm page while SAM scans the overview and refines each candidate.
